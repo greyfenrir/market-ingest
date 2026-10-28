@@ -138,8 +138,9 @@ class FakeSink:
     def of(self, table): return [r for t, r in self.rows if t == table]
 
 class FakeStatsd:
+    def __init__(self): self.gauges = {}
     def incr(self, *a, **k): pass
-    def gauge(self, *a, **k): pass
+    def gauge(self, name, value): self.gauges[name] = value
 
 def make(depth=None):
     sink = FakeSink()
@@ -351,6 +352,18 @@ check("not again within refresh_min_seconds", sync.shadow, None)
 sync.cover0 = (50.0, 50.0)
 c._emit_book_rows(SEC + 4, M0 + 100)
 check("but after it", sync.shadow is not None, True)
+
+print("== quality gauge: the worst book's share of seconds not ok")
+c, sink = make({"symbols": ["BTCUSDT", "ETHUSDT"]})
+c.depth["ETHUSDT"].on_snapshot({**SNAP, "symbol": "ETHUSDT"})
+feed(c, {**ev(100, 104, 99), "s": "ETHUSDT"})
+for i in range(6):                                  # BTC never synced: resync
+    c._emit_book_rows(SEC + i, time.monotonic())
+check("6 bad seconds of 600 is 1 %", c.sd.gauges["book_not_ok_pct.binance_um"], 1.0)
+check("ETH is ok, so one book not ok right now", c.sd.gauges["book_not_ok.binance_um"], 1)
+c2, _ = make({"enabled": False})
+c2._emit_book_rows(SEC, time.monotonic())
+check("no books, no gauge", "book_not_ok_pct.binance_um" in c2.sd.gauges, False)
 
 print("== ws loop: on_open and on_close bracket every attempt")
 import ingest.exchanges.binance_um as bu

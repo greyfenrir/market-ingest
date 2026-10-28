@@ -66,5 +66,18 @@ st2.roll(200); st2.observe(nbytes=1, rows=1, lag_ms=-500, symbol="BTC")
 check("clamped to zero", st2.roll(201)["lag_ms_p50"], 0)
 
 print()
+print("== RollingShare: bad share of a fixed window")
+from ingest.health import RollingShare
+q = RollingShare(10)
+check("empty is 0 %", q.pct(), 0.0)
+q.add(True); q.add(True)
+check("a start's resync is a share of the whole window", q.pct(), 20.0)
+for _ in range(8): q.add(False)
+check("window full", q.pct(), 20.0)
+q.add(False); q.add(False)
+check("old bad seconds slide out", q.pct(), 0.0)
+for _ in range(15): q.add(True)
+check("never above 100 %", q.pct(), 100.0)
+
 print("ALL PASSED" if not fails else f"FAILURES: {fails}")
 raise SystemExit(1 if fails else 0)

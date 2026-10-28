@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
@@ -133,6 +134,28 @@ class SequenceTracker:
         figure worth having. Gaps found across a reconnect are recorded
         separately so a planned restart can be told from a silent drop."""
         self._reconnected.update(self._last)
+
+
+class RollingShare:
+    """Share of the last `window` observations that were bad, in percent.
+
+    The denominator is the full window even before it has filled, so the
+    second or two of `resync` every start reads as a fraction of a percent
+    rather than as 100 % of a window one second long."""
+
+    def __init__(self, window: int) -> None:
+        self.window = window
+        self._bits: deque[bool] = deque(maxlen=window)
+        self._bad = 0
+
+    def add(self, bad: bool) -> None:
+        if len(self._bits) == self.window:
+            self._bad -= self._bits[0]
+        self._bits.append(bad)
+        self._bad += bad
+
+    def pct(self) -> float:
+        return 100.0 * self._bad / self.window
 
 
 def new_session_id() -> str:

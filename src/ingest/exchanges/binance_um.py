@@ -31,6 +31,7 @@ from ..book import BANDS_PCT, empty_aggregate
 from ..metrics import Statsd
 from .binance_um_depth import SYNCING, DepthSync
 from ..health import (
+    RollingShare,
     SequenceTracker,
     StreamStats,
     ch_ts,
@@ -45,6 +46,8 @@ WS_MARKET = "wss://fstream.binance.com/market"
 WS_PUBLIC = "wss://fstream.binance.com/public"
 REST = "https://fapi.binance.com"
 EXCHANGE = "binance_um"
+# Window of the per-book quality share that the Netdata alarm watches.
+BOOK_QUALITY_WINDOW_S = 600
 
 # Fields we model explicitly. Anything else the exchange sends is preserved
 # verbatim in `extra` - Binance added `nq` and `ap` in the 2026 COIN-M merge,
@@ -95,6 +98,9 @@ class BinanceUM:
             {s: DepthSync(s, self.depth_limit) for s in sorted(syms)}
             if dcfg.get("enabled", False) else {}
         )
+        # Seconds not `ok`, per book. The worst book is what gets published:
+        # one book broken all the time is 5 % of twenty, easy to miss in a sum.
+        self._book_quality = {s: RollingShare(BOOK_QUALITY_WINDOW_S) for s in self.depth}
         self.collector_version = os.environ.get("COLLECTOR_VERSION", "")
         self._rest: aiohttp.ClientSession | None = None
         self._snap_sem: asyncio.Semaphore | None = None
@@ -520,6 +526,7 @@ class BinanceUM:
             else:
                 state = "ok"
             not_ok += state != "ok"
+            self._book_quality[sync.symbol].add(state != "ok")
             row = {
                 "exchange": EXCHANGE,
                 "symbol": sync.symbol,
@@ -536,6 +543,9 @@ class BinanceUM:
             self.sink.write("market.book_agg", row)
         self.sd.incr(f"rows.{EXCHANGE}.book_agg", len(self.depth))
         self.sd.gauge(f"book_not_ok.{EXCHANGE}", not_ok)
+        if self._book_quality:
+            self.sd.gauge(f"book_not_ok_pct.{EXCHANGE}",
+                          round(max(q.pct() for q in self._book_quality.values()), 2))
 
     async def _depth_tick_loop(self) -> None:
         """Fires just after each wall-clock second. The clock is the local one,
