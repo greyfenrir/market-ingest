@@ -92,19 +92,43 @@ async def amain(args) -> int:
         loop.add_signal_handler(sig, stopping.set)
 
     task = asyncio.create_task(collector.run(), name=args.exchange)
-    await stopping.wait()
-    logging.info("shutdown requested, draining")
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    code = await run_until_stopped(task, stopping)
     # Drain the sink so the last couple of seconds of market data are not lost
     # to a routine restart.
     await sink.stop()
     await sd.stop()
     logging.info("inserted=%d dropped=%d insert_errors=%d",
                  sink.inserted_rows, sink.dropped_rows, sink.insert_errors)
+    return code
+
+
+async def run_until_stopped(task: asyncio.Task, stopping: asyncio.Event) -> int:
+    """Wait for a stop signal or for the collector to end, whichever is first.
+
+    A collector that ends on its own has failed: its streams are cancelled and
+    nothing is being collected, yet the process would stay up and systemd would
+    never restart it. Return a non-zero code so that it does.
+    """
+    stop_wait = asyncio.ensure_future(stopping.wait())
+    try:
+        await asyncio.wait({task, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        stop_wait.cancel()
+    if task.done():
+        if task.cancelled():
+            logging.error("collector task was cancelled, exiting")
+        elif task.exception() is not None:
+            logging.error("collector crashed, exiting for a restart",
+                          exc_info=task.exception())
+        else:
+            logging.error("collector returned unexpectedly, exiting for a restart")
+        return 1
+    logging.info("shutdown requested, draining")
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
     return 0
 
 
