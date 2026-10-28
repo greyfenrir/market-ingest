@@ -14,6 +14,13 @@ starts over from a fresh snapshot. A book that has drifted cannot be repaired
 in place, and a wrong book is worse than an empty one: it produces confident
 numbers.
 
+REFRESH WITHOUT A GAP. A snapshot's reach is fixed when it is taken, and the
+market walks away from it: on BTC +-0.16 % is gone within minutes, and from
+then on one side of the book has no trusted range at all. A refresh builds a
+second, shadow DepthSync from a fresh snapshot using the very same procedure,
+feeds it the same events as the live book, and swaps it in the moment both
+stand on the same update id. The live book never stops in between.
+
 No I/O here. The connector decides when to fetch a snapshot; this class only
 says whether it needs one and what to do with it.
 """
@@ -47,6 +54,16 @@ class DepthSync:
         self.resyncs = 0
         self.last_event_ms = 0.0      # exchange transaction time of the last applied event
         self.last_applied_mono = 0.0  # local monotonic time of the last applied event
+        # Flags for the connector to log and clear: the book went live, or a
+        # refresh was swapped in. Kept here so this class stays free of I/O.
+        self.just_live = False
+        self.just_refreshed = False
+        # Refresh: the shadow being built, when the last one started, and the
+        # coverage (bid %, ask %) measured on the book's first live aggregate,
+        # i.e. how far a fresh snapshot reached.
+        self.shadow: DepthSync | None = None
+        self.last_refresh_mono = float("-inf")
+        self.cover0: tuple[float, float] | None = None
         self._new_second()
 
     # ------------------------------------------------------------------ api
@@ -71,7 +88,13 @@ class DepthSync:
             if len(self.buffer) > self.MAX_BUFFER:
                 del self.buffer[: len(self.buffer) - self.MAX_BUFFER]
             return None
-        return self._step(ev, mono)
+        reason = self._step(ev, mono)
+        if reason is None and self.shadow is not None:
+            # A shadow that breaks just starts over by itself; the live book
+            # is unaffected either way.
+            self.shadow.on_event(ev, mono)
+            self.try_swap()
+        return reason
 
     def on_snapshot(self, snap: dict, mono: float = 0.0) -> str | None:
         """Load a REST /fapi/v1/depth response and replay the buffer onto it.
@@ -102,7 +125,32 @@ class DepthSync:
         self.snapshot_pending = False
         self.generation += 1
         self.resyncs += 1
+        self.shadow = None      # it was following a sequence that just ended
+        self.cover0 = None
         return reason
+
+    def start_refresh(self, mono: float) -> bool:
+        """Begin building a shadow book. It buffers from now on and asks for
+        its own snapshot (needs_snapshot), exactly as a book does at startup.
+        Only one at a time, and only for a live book."""
+        if not self.live or self.shadow is not None:
+            return False
+        self.shadow = DepthSync(self.symbol, self.depth_limit)
+        self.last_refresh_mono = mono
+        return True
+
+    def try_swap(self) -> bool:
+        """Swap the shadow in once it is live and on the same update id as the
+        live book. Both apply the same events after alignment, so equal ids
+        mean equal books inside the old range - and a wider one outside it."""
+        sh = self.shadow
+        if sh is None or not sh.live or sh.book.last_update_id != self.book.last_update_id:
+            return False
+        self.book = sh.book
+        self.shadow = None
+        self.cover0 = None      # measured again on the next aggregate
+        self.just_refreshed = True
+        return True
 
     def take_second(self) -> dict:
         """Counters for the second that just ended, then start a new one."""
@@ -123,6 +171,7 @@ class DepthSync:
             if first_id > book_id:
                 return self.reset(f"gap after snapshot: U={first_id} > lastUpdateId={book_id}")
             self.state = LIVE               # U <= lastUpdateId <= u
+            self.just_live = True
         else:
             if last_id <= book_id:
                 return None                 # already applied (redelivery)

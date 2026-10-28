@@ -75,3 +75,9 @@ max_parallel_snapshots = 2
 prune_pct              = 10
 # A live book with no delta for this long is reported as stale.
 stale_seconds          = 5
+# A snapshot's reach is fixed when it is taken; the market walks away from it.
+# Once either side keeps less than refresh_ratio of the coverage the snapshot
+# had, a fresh one is built alongside and swapped in without a gap - at most
+# once per refresh_min_seconds per symbol (20 weight each).
+refresh_ratio          = 0.5
+refresh_min_seconds    = 60

@@ -87,6 +87,10 @@ class BinanceUM:
         self.depth_prune_pct = float(dcfg.get("prune_pct", 10.0))
         self.depth_stale_s = float(dcfg.get("stale_seconds", 5.0))
         self.depth_parallel = int(dcfg.get("max_parallel_snapshots", 2))
+        # Refresh a book once either side keeps less than this share of the
+        # coverage its snapshot had, but not more often than every N seconds.
+        self.depth_refresh_ratio = float(dcfg.get("refresh_ratio", 0.5))
+        self.depth_refresh_min_s = float(dcfg.get("refresh_min_seconds", 60.0))
         self.depth: dict[str, DepthSync] = (
             {s: DepthSync(s, self.depth_limit) for s in sorted(syms)}
             if dcfg.get("enabled", False) else {}
@@ -328,6 +332,16 @@ class BinanceUM:
         log.warning("%s depth resync: %s", sync.symbol, reason)
         self.sd.incr(f"resyncs.{EXCHANGE}.depth", 1)
 
+    def _depth_report(self, sync: DepthSync) -> None:
+        """Log what DepthSync flagged since the last call."""
+        if sync.just_live:
+            sync.just_live = False
+            self._event("depth", "synced", f"{sync.symbol} u={sync.book.last_update_id}")
+        if sync.just_refreshed:
+            sync.just_refreshed = False
+            self._event("depth", "refresh", f"{sync.symbol} done: u={sync.book.last_update_id}")
+            self.sd.incr(f"refreshes.{EXCHANGE}.depth", 1)
+
     def _depth_on_open(self) -> None:
         """A new connection continues no sequence we can vouch for: events
         missed between the two sessions are unknown. Start every book over."""
@@ -353,6 +367,7 @@ class BinanceUM:
         reason = sync.on_event(payload, time.monotonic())
         if reason:
             self._depth_resync(sync, reason)
+        self._depth_report(sync)
         # rows=0: deltas are not stored, only the per-second aggregate is
         st.observe(nbytes=nbytes, rows=0, lag_ms=int(recv_ms - float(payload["E"])),
                    symbol=sync.symbol)
@@ -372,17 +387,23 @@ class BinanceUM:
             return 0
         started = 0
         for sync in self.depth.values():
-            if sync.needs_snapshot:
-                sync.snapshot_pending = True
-                t = asyncio.create_task(self._fetch_snapshot(sync),
-                                        name=f"snapshot:{sync.symbol}")
-                self._bg.add(t)
-                t.add_done_callback(self._bg.discard)
-                started += 1
+            # the book itself, or the shadow a refresh is building for it
+            for target, owner in ((sync, None), (sync.shadow, sync)):
+                if target is not None and target.needs_snapshot:
+                    target.snapshot_pending = True
+                    t = asyncio.create_task(self._fetch_snapshot(target, owner),
+                                            name=f"snapshot:{sync.symbol}")
+                    self._bg.add(t)
+                    t.add_done_callback(self._bg.discard)
+                    started += 1
         return started
 
-    async def _fetch_snapshot(self, sync: DepthSync) -> None:
+    async def _fetch_snapshot(self, sync: DepthSync, owner: DepthSync | None = None) -> None:
         """Fetch /fapi/v1/depth until it aligns with the buffered events.
+
+        `sync` is a book, or - with `owner` set - the shadow a refresh is
+        building for `owner`. A shadow's misalignment is not a resync: the
+        live book is untouched, so it is logged as a refresh retry instead.
 
         A 1000-level snapshot weighs 20, and at most `max_parallel_snapshots`
         are in flight, so a mass reconnect of every book costs a few hundred
@@ -394,10 +415,16 @@ class BinanceUM:
         assert self._rest is not None and self._snap_sem is not None
         gen = sync.generation
         delay = 1.0
-        while sync.generation == gen and self._depth_open:
+
+        def wanted() -> bool:
+            # a shadow is dropped when its owner resets or swaps it in
+            return (sync.generation == gen and self._depth_open
+                    and (owner is None or owner.shadow is sync))
+
+        while wanted():
             snap = None
             async with self._snap_sem:
-                if sync.generation != gen or not self._depth_open:
+                if not wanted():
                     return
                 try:
                     async with self._rest.get(
@@ -424,18 +451,44 @@ class BinanceUM:
                 await asyncio.sleep(delay)
                 delay = min(30.0, delay * 2)
                 continue
-            if sync.generation != gen:
-                return  # the book was reset while this was in flight
+            if not wanted():
+                return  # the book was reset, or the shadow dropped, meanwhile
             reason = sync.on_snapshot(snap, time.monotonic())
             if reason is None:
-                self._event("depth", "synced", f"{sync.symbol} lastUpdateId={snap['lastUpdateId']}")
+                if owner is None:
+                    self._event("depth", "snapshot", f"{sync.symbol} lastUpdateId={snap['lastUpdateId']}")
+                    self._depth_report(sync)    # live already, if the buffer spanned it
+                else:
+                    owner.try_swap()
+                    self._depth_report(owner)
                 return
-            self._depth_resync(sync, reason)
+            if owner is None:
+                self._depth_resync(sync, reason)
+            else:
+                self._event("depth", "refresh", f"{sync.symbol} retry: {reason}")
             # This task keeps the job; stop the scheduler from starting another.
             gen = sync.generation
             sync.snapshot_pending = True
             await asyncio.sleep(delay)
             delay = min(30.0, delay * 2)
+
+    def _depth_maybe_refresh(self, sync: DepthSync, agg: dict, mono: float) -> None:
+        """Start a refresh once the snapshot's reach has worn thin on either
+        side. The first aggregate of a fresh book records what a snapshot
+        reaches for this symbol; later ones are measured against it, so a book
+        whose snapshot spans +-10 % is not refreshed every time BTC's would be."""
+        bid, ask = agg["covered_bid_pct"], agg["covered_ask_pct"]
+        if sync.cover0 is None:
+            sync.cover0 = (bid, ask)
+            return
+        bid0, ask0 = sync.cover0
+        r = self.depth_refresh_ratio
+        worn = (bid0 > 0 and bid < bid0 * r) or (ask0 > 0 and ask < ask0 * r)
+        if (worn and mono - sync.last_refresh_mono >= self.depth_refresh_min_s
+                and sync.start_refresh(mono)):
+            self._event("depth", "refresh",
+                        f"{sync.symbol} started: covered {bid:.3f}/{ask:.3f}% "
+                        f"of {bid0:.3f}/{ask0:.3f}% at snapshot")
 
     def _emit_book_rows(self, second: int, mono: float) -> None:
         """One market.book_agg row per book for the second ending at `second`.
@@ -455,6 +508,7 @@ class BinanceUM:
                     self._depth_resync(sync, sync.reset("crossed book"))
                 else:
                     agg = sync.book.aggregate(BANDS_PCT, mark=self._last_mark.get(sync.symbol))
+                    self._depth_maybe_refresh(sync, agg, mono)
             if agg is None:
                 state = "resync"
             elif counters["resynced"] or not agg["covered_bid_pct"] or not agg["covered_ask_pct"]:
@@ -581,7 +635,8 @@ class BinanceUM:
             f"rows.{EXCHANGE}.open_interest",
         )
         if self.depth:
-            self.sd.prime(f"rows.{EXCHANGE}.book_agg", f"resyncs.{EXCHANGE}.depth")
+            self.sd.prime(f"rows.{EXCHANGE}.book_agg", f"resyncs.{EXCHANGE}.depth",
+                          f"refreshes.{EXCHANGE}.depth")
         await self._validate_focus()
         focus_streams = "/".join(f"{s.lower()}@aggTrade" for s in sorted(self.focus))
         tasks = [

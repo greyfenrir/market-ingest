@@ -77,6 +77,49 @@ check("a reset marks the second", s.take_second()["resynced"], True)
 s.reset("test again")                                 # already waiting for a snapshot
 check("resetting a book that had none does not", s.take_second()["resynced"], False)
 
+s = DepthSync("BTCUSDT")
+s.on_snapshot(SNAP)
+check("not live while aligning", s.just_live, False)
+s.on_event(ev(100, 104, 99))
+check("flags the moment it goes live", s.just_live, True)
+
+print("== refresh: a shadow book is built alongside and swapped in without a gap")
+FRESH = {"lastUpdateId": 105, "bids": [["99.95", "1"], ["99.9", "1"], ["98.0", "1"]],
+         "asks": [["100.1", "1"], ["100.4", "1"], ["102.0", "1"]]}
+s = DepthSync("BTCUSDT", depth_limit=3)               # 3-level snapshots are truncated
+check("no refresh before live", s.start_refresh(0.0), False)
+s.on_snapshot(SNAP); s.on_event(ev(100, 104, 99))
+check("snapshot reach: bids trusted to 99.0", s.book.bid_floor, 99.0)
+check("live book starts a refresh", s.start_refresh(5.0), True)
+check("only one at a time", s.start_refresh(6.0), False)
+sh = s.shadow
+check("shadow waits for an event before its snapshot", sh.needs_snapshot, False)
+s.on_event(ev(105, 106, 104, b=[("99.95", "1")]))
+check("live book keeps applying", (s.live, s.book.best_bid()), (True, 99.95))
+check("shadow buffered the same event", (len(sh.buffer), sh.needs_snapshot), (1, True))
+check("shadow aligns with its buffer", sh.on_snapshot(FRESH), None)
+check("and swaps in on the same update id", s.try_swap(), True)
+check("the refreshed book reaches further", (s.shadow, s.book.bid_floor, s.just_refreshed), (None, 98.0, True))
+check("live throughout, no reset", (s.live, s.book.last_update_id, s.resyncs), (True, 106, 0))
+
+s = DepthSync("BTCUSDT", depth_limit=3)
+s.on_snapshot(SNAP); s.on_event(ev(100, 104, 99))
+s.start_refresh(0.0)
+s.on_event(ev(105, 106, 104))
+s.shadow.on_snapshot({**FRESH, "lastUpdateId": 107})   # newer than anything buffered
+check("shadow ahead of the live book waits", (s.try_swap(), s.shadow.state), (False, ALIGNING))
+s.on_event(ev(107, 108, 106))
+check("next event aligns it and swaps", (s.shadow, s.just_refreshed, s.book.last_update_id), (None, True, 108))
+
+s = DepthSync("BTCUSDT", depth_limit=3)
+s.on_snapshot(SNAP); s.on_event(ev(100, 104, 99))
+s.start_refresh(0.0); sh = s.shadow
+s.on_event(ev(105, 106, 104))
+check("a shadow that cannot align starts over", sh.on_snapshot({**FRESH, "lastUpdateId": 100}).startswith("gap"), True)
+check("the live book does not notice", (s.live, s.shadow is sh, s.resyncs), (True, True, 0))
+s.reset("pu break")
+check("a reset drops the shadow", s.shadow, None)
+
 class Tiny(DepthSync):
     MAX_BUFFER = 3
 s = Tiny("BTCUSDT")
@@ -215,14 +258,14 @@ check("response for a reset book is discarded", (sync.state, sync.book.synced, r
 c, sink = make()
 c.depth["BTCUSDT"].on_event(ev(150, 160, 149))       # buffer starts after the snapshot
 fetch(c, Rest(Resp(500), Resp(200, SNAP), Resp(200, {**SNAP, "lastUpdateId": 155})))
-check("error, misaligned, then aligned",
-      [e for e, _ in events(sink)], ["error", "resync", "synced"])
+check("error, misaligned, then loaded (live on the next event)",
+      [e for e, _ in events(sink)], ["error", "resync", "snapshot"])
 
 print("== connector: snapshots wait for an open stream")
 def scheduler_pass(c):
     started = []
-    async def fake_fetch(sync):
-        started.append(sync.symbol)
+    async def fake_fetch(sync, owner=None):
+        started.append(sync.symbol if owner is None else sync.symbol + "/shadow")
     c._fetch_snapshot = fake_fetch
     async def go():
         n = c._depth_request_snapshots()
@@ -250,6 +293,64 @@ async def fetch_closed():
     await c._fetch_snapshot(c.depth["BTCUSDT"])  # _depth_open is False
 asyncio.run(fetch_closed())
 check("a fetch gives up while the stream is closed", (rest.calls, c.depth["BTCUSDT"].live), (0, False))
+
+print("== connector: synced is logged when the book goes live")
+c, sink = make()
+c.depth["BTCUSDT"].on_snapshot(SNAP)
+check("loading a snapshot is not yet synced", events(sink), [])
+feed(c, ev(100, 104, 99))
+check("the spanning event is", events(sink), [("synced", "BTCUSDT u=104")])
+
+print("== connector: refresh when the snapshot's reach wears thin")
+c, sink = make({"snapshot_limit": 3, "refresh_min_seconds": 60})
+sync = c.depth["BTCUSDT"]
+c._depth_open = True
+sync.on_snapshot(SNAP); feed(c, ev(100, 104, 99))
+M0 = 1000.0
+c._emit_book_rows(SEC, M0)
+check("first aggregate records the reach", sync.cover0, (1.0, 1.0))
+# the market lifts: asks up to 100.4 are taken, a bid appears at 100.6
+feed(c, ev(105, 105, 104, b=[("100.6", "1")], a=[("100.1", "0"), ("100.4", "0"), ("100.7", "1")]))
+c._emit_book_rows(SEC + 1, M0 + 1)
+check("ask side under half its reach: refresh starts",
+      (events(sink)[-1][0], events(sink)[-1][1].split(":")[0], sync.shadow is not None),
+      ("refresh", "BTCUSDT started", True))
+check("rows stay ok meanwhile", sink.of("market.book_agg")[-1]["state"], "ok")
+feed(c, ev(106, 106, 105))                            # the shadow's first buffered event
+check("scheduler fetches for the shadow", scheduler_pass(c), (1, ["BTCUSDT/shadow"]))
+
+c, sink = make({"snapshot_limit": 3, "refresh_min_seconds": 60})
+sync = c.depth["BTCUSDT"]
+sync.on_snapshot(SNAP); feed(c, ev(100, 104, 99))
+c._emit_book_rows(SEC, M0)
+feed(c, ev(105, 105, 104, b=[("100.6", "1")], a=[("100.1", "0"), ("100.4", "0"), ("100.7", "1")]))
+c._emit_book_rows(SEC + 1, M0 + 1)
+feed(c, ev(106, 106, 105))
+FRESH2 = {"lastUpdateId": 106, "bids": [["100.6", "1"], ["100.0", "1"], ["99.5", "1"]],
+          "asks": [["100.7", "1"], ["101.0", "1"], ["102.5", "1"]]}
+async def fetch_shadow():
+    real = asyncio.sleep
+    asyncio.sleep = lambda *_: real(0)
+    try:
+        c._rest, c._snap_sem, c._depth_open = Rest(Resp(200, FRESH2)), asyncio.Semaphore(1), True
+        await c._fetch_snapshot(sync.shadow, sync)
+    finally:
+        asyncio.sleep = real
+asyncio.run(fetch_shadow())
+check("swapped in, logged as refresh done", events(sink)[-1], ("refresh", "BTCUSDT done: u=106"))
+check("no resync anywhere", [e for e, _ in events(sink) if e == "resync"], [])
+check("reach renewed", (sync.shadow, sync.book.ask_ceil), (None, 102.5))
+c._emit_book_rows(SEC + 2, M0 + 2)
+row = sink.of("market.book_agg")[-1]
+check("next row ok, ask coverage back", (row["state"], round(row["covered_ask_pct"], 2)), ("ok", 1.84))
+check("reach measured afresh", sync.cover0 is not None, True)
+
+sync.cover0 = (50.0, 50.0)                            # pretend it is worn again at once
+c._emit_book_rows(SEC + 3, M0 + 10)
+check("not again within refresh_min_seconds", sync.shadow, None)
+sync.cover0 = (50.0, 50.0)
+c._emit_book_rows(SEC + 4, M0 + 100)
+check("but after it", sync.shadow is not None, True)
 
 print("== ws loop: on_open and on_close bracket every attempt")
 import ingest.exchanges.binance_um as bu
