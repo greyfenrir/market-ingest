@@ -19,13 +19,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import os
 import random
 import time
 
 import aiohttp
 import websockets
 
+from ..book import BANDS_PCT, empty_aggregate
 from ..metrics import Statsd
+from .binance_um_depth import SYNCING, DepthSync
 from ..health import (
     SequenceTracker,
     StreamStats,
@@ -38,6 +42,7 @@ from ..health import (
 log = logging.getLogger(__name__)
 
 WS_MARKET = "wss://fstream.binance.com/market"
+WS_PUBLIC = "wss://fstream.binance.com/public"
 REST = "https://fapi.binance.com"
 EXCHANGE = "binance_um"
 
@@ -69,6 +74,27 @@ class BinanceUM:
         # last mark-price observation per non-focus symbol, flushed once a minute
         self._pending_mark: dict[str, dict] = {}
         self._pending_minute: int = 0
+        # latest mark price per focus symbol: depth is priced in USD at mark
+        self._last_mark: dict[str, float] = {}
+
+        # Order book (stream A of the early-collector spec): a local book per
+        # symbol, written as one aggregate row per second. Off unless enabled.
+        dcfg = cfg.get("depth", {})
+        syms = dcfg.get("symbols", "focus")
+        syms = self.focus if syms == "focus" else {s.upper() for s in syms}
+        self.depth_limit = int(dcfg.get("snapshot_limit", 1000))
+        self.depth_speed_ms = int(dcfg.get("update_speed_ms", 100))
+        self.depth_prune_pct = float(dcfg.get("prune_pct", 10.0))
+        self.depth_stale_s = float(dcfg.get("stale_seconds", 5.0))
+        self.depth_parallel = int(dcfg.get("max_parallel_snapshots", 2))
+        self.depth: dict[str, DepthSync] = (
+            {s: DepthSync(s, self.depth_limit) for s in sorted(syms)}
+            if dcfg.get("enabled", False) else {}
+        )
+        self.collector_version = os.environ.get("COLLECTOR_VERSION", "")
+        self._rest: aiohttp.ClientSession | None = None
+        self._snap_sem: asyncio.Semaphore | None = None
+        self._bg: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------ util
 
@@ -105,10 +131,12 @@ class BinanceUM:
 
     # ------------------------------------------------------------ ws plumbing
 
-    async def _ws_loop(self, stream: str, url: str, handle) -> None:
+    async def _ws_loop(self, stream: str, url: str, handle, on_open=None) -> None:
         """Connect, consume, and never give up. Backoff is exponential with
         jitter so that a Binance-side outage does not turn our reconnects into
-        a self-inflicted IP ban."""
+        a self-inflicted IP ban. on_open runs on every (re)connect, before the
+        first message: state that does not survive a new connection is reset
+        there."""
         attempt = 0
         while True:
             started = time.monotonic()
@@ -123,6 +151,8 @@ class BinanceUM:
                     st.last_msg_monotonic = time.monotonic()
                     self._event(stream, "open")
                     log.info("%s connected", stream)
+                    if on_open:
+                        on_open()
                     await self._consume(ws, stream, st, handle, started)
             except asyncio.CancelledError:
                 self._event(stream, "stop")
@@ -195,6 +225,7 @@ class BinanceUM:
             }
             if sym in self.focus:
                 self.sink.write("market.mark_price", row)
+                self._last_mark[sym] = row["mark_price"]
             else:
                 # Keep only the newest observation; it is written once the
                 # minute closes. 935 symbols x 1/s would be 65M rows a day,
@@ -283,6 +314,159 @@ class BinanceUM:
         self.sd.incr(f"rows.{EXCHANGE}.force_order", 1)
         self.sd.incr(f"bytes.{EXCHANGE}.force_order", nbytes)
 
+    # ----------------------------------------------------------- order book
+
+    def _depth_resync(self, sync: DepthSync, reason: str) -> None:
+        self._event("depth", "resync", f"{sync.symbol}: {reason}")
+        log.warning("%s depth resync: %s", sync.symbol, reason)
+        self.sd.incr(f"resyncs.{EXCHANGE}.depth", 1)
+
+    def _depth_on_open(self) -> None:
+        """A new connection continues no sequence we can vouch for: events
+        missed between the two sessions are unknown. Start every book over."""
+        for sync in self.depth.values():
+            was = sync.state
+            sync.reset("reconnect")
+            if was != SYNCING:
+                self._depth_resync(sync, "reconnect")
+
+    def _handle_depth(self, payload, recv_ms: float, nbytes: int, st: StreamStats) -> None:
+        if payload.get("e") != "depthUpdate":
+            return
+        sync = self.depth.get(payload.get("s"))
+        if sync is None:
+            return
+        reason = sync.on_event(payload, time.monotonic())
+        if reason:
+            self._depth_resync(sync, reason)
+        # rows=0: deltas are not stored, only the per-second aggregate is
+        st.observe(nbytes=nbytes, rows=0, lag_ms=int(recv_ms - float(payload["E"])),
+                   symbol=sync.symbol)
+        self.sd.incr(f"bytes.{EXCHANGE}.depth", nbytes)
+
+    async def _depth_snapshot_loop(self) -> None:
+        """Starts a snapshot fetch for every book that needs one. Kept apart
+        from the message handler so that handling a message never has to
+        spawn tasks, and so that a burst of resyncs is paced by one place."""
+        while True:
+            for sync in self.depth.values():
+                if sync.needs_snapshot:
+                    sync.snapshot_pending = True
+                    t = asyncio.create_task(self._fetch_snapshot(sync),
+                                            name=f"snapshot:{sync.symbol}")
+                    self._bg.add(t)
+                    t.add_done_callback(self._bg.discard)
+            await asyncio.sleep(0.2)
+
+    async def _fetch_snapshot(self, sync: DepthSync) -> None:
+        """Fetch /fapi/v1/depth until it aligns with the buffered events.
+
+        A 1000-level snapshot weighs 20, and at most `max_parallel_snapshots`
+        are in flight, so a mass reconnect of every book costs a few hundred
+        weight spread over seconds rather than one burst. 429 and 418 are
+        obeyed: Binance turns ignored 429s into an IP ban."""
+        assert self._rest is not None and self._snap_sem is not None
+        gen = sync.generation
+        delay = 1.0
+        while sync.generation == gen:
+            snap = None
+            async with self._snap_sem:
+                if sync.generation != gen:
+                    return
+                try:
+                    async with self._rest.get(
+                        f"{REST}/fapi/v1/depth",
+                        params={"symbol": sync.symbol, "limit": self.depth_limit},
+                    ) as r:
+                        if r.status in (418, 429):
+                            # Sleeping while holding the slot pauses the other
+                            # snapshots too, which is the point.
+                            wait = float(r.headers.get("Retry-After") or 60)
+                            self._event("depth", "rate_limit",
+                                        f"{sync.symbol} HTTP {r.status}, retry after {wait:.0f}s")
+                            log.error("depth snapshot rate-limited (HTTP %d), pausing %.0fs",
+                                      r.status, wait)
+                            await asyncio.sleep(wait)
+                            continue
+                        if r.status != 200:
+                            raise RuntimeError(f"HTTP {r.status}: {(await r.text())[:200]}")
+                        snap = await r.json()
+                except Exception as exc:  # noqa: BLE001
+                    self._event("depth", "error", f"{sync.symbol} snapshot: {type(exc).__name__}: {exc}")
+                    log.warning("%s depth snapshot failed: %s", sync.symbol, exc)
+            if snap is None:
+                await asyncio.sleep(delay)
+                delay = min(30.0, delay * 2)
+                continue
+            if sync.generation != gen:
+                return  # the book was reset while this was in flight
+            reason = sync.on_snapshot(snap, time.monotonic())
+            if reason is None:
+                self._event("depth", "synced", f"{sync.symbol} lastUpdateId={snap['lastUpdateId']}")
+                return
+            self._depth_resync(sync, reason)
+            # This task keeps the job; stop the scheduler from starting another.
+            gen = sync.generation
+            sync.snapshot_pending = True
+            await asyncio.sleep(delay)
+            delay = min(30.0, delay * 2)
+
+    def _emit_book_rows(self, second: int, mono: float) -> None:
+        """One market.book_agg row per book for the second ending at `second`.
+
+        A row is written for every book every second, valid or not: a second
+        without a usable book is recorded as such (state=resync, zeros, every
+        band invalid), so the archive never has to be read for silence."""
+        ingest = ch_ts(now_ms())
+        event_time = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(second))
+        not_ok = 0
+        for sync in self.depth.values():
+            counters = sync.take_second()
+            agg = None
+            if sync.live:
+                sync.book.prune(self.depth_prune_pct)
+                if sync.book.crossed():
+                    self._depth_resync(sync, sync.reset("crossed book"))
+                else:
+                    agg = sync.book.aggregate(BANDS_PCT, mark=self._last_mark.get(sync.symbol))
+            if agg is None:
+                state = "resync"
+            elif counters["resynced"] or not agg["covered_bid_pct"] or not agg["covered_ask_pct"]:
+                # resynced within the second, or price has left the range the
+                # snapshot covered: the numbers exist but are not the whole truth
+                state = "degraded"
+            elif mono - sync.last_applied_mono > self.depth_stale_s:
+                state = "stale"
+            else:
+                state = "ok"
+            not_ok += state != "ok"
+            row = {
+                "exchange": EXCHANGE,
+                "symbol": sync.symbol,
+                "event_time": event_time,
+                "ingest_time": ingest,
+                "last_update_time": ch_ts(sync.last_event_ms),
+                "seq_first": counters["seq_first"],
+                "seq_last": counters["seq_last"],
+                "n_updates": counters["n_updates"],
+                "state": state,
+                "collector_version": self.collector_version,
+            }
+            row.update(agg or empty_aggregate(BANDS_PCT))
+            self.sink.write("market.book_agg", row)
+        self.sd.incr(f"rows.{EXCHANGE}.book_agg", len(self.depth))
+        self.sd.gauge(f"book_not_ok.{EXCHANGE}", not_ok)
+
+    async def _depth_tick_loop(self) -> None:
+        """Fires just after each wall-clock second. The clock is the local one,
+        kept honest by chrony; a second the loop oversleeps is skipped rather
+        than invented, because the book's state at that instant is gone."""
+        while True:
+            now = time.time()
+            boundary = math.floor(now) + 1
+            await asyncio.sleep(boundary - now + 0.05)
+            self._emit_book_rows(int(boundary), time.monotonic())
+
     # ---------------------------------------------------------- open interest
 
     async def _open_interest_loop(self) -> None:
@@ -370,6 +554,8 @@ class BinanceUM:
             f"rows.{EXCHANGE}.force_order",
             f"rows.{EXCHANGE}.open_interest",
         )
+        if self.depth:
+            self.sd.prime(f"rows.{EXCHANGE}.book_agg", f"resyncs.{EXCHANGE}.depth")
         await self._validate_focus()
         focus_streams = "/".join(f"{s.lower()}@aggTrade" for s in sorted(self.focus))
         tasks = [
@@ -384,8 +570,26 @@ class BinanceUM:
                 name="force_order"),
             asyncio.create_task(self._open_interest_loop(), name="open_interest"),
         ]
+        if self.depth:
+            # Separate connection on /public: depth is not served on /market,
+            # and a stream on the wrong route is accepted and stays silent.
+            self._rest = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+            self._snap_sem = asyncio.Semaphore(self.depth_parallel)
+            depth_streams = "/".join(f"{s.lower()}@depth@{self.depth_speed_ms}ms"
+                                     for s in self.depth)
+            tasks += [
+                asyncio.create_task(
+                    self._ws_loop("depth", f"{WS_PUBLIC}/stream?streams={depth_streams}",
+                                  self._handle_depth, on_open=self._depth_on_open),
+                    name="depth"),
+                asyncio.create_task(self._depth_snapshot_loop(), name="depth_snapshots"),
+                asyncio.create_task(self._depth_tick_loop(), name="depth_tick"),
+            ]
+            log.info("order book: %d symbols at %d ms", len(self.depth), self.depth_speed_ms)
         try:
             await asyncio.gather(*tasks)
         finally:
-            for t in tasks:
+            for t in [*tasks, *self._bg]:
                 t.cancel()
+            if self._rest:
+                await self._rest.close()

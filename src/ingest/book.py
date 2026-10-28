@@ -176,6 +176,22 @@ class LocalBook:
         return row
 
 
+def empty_aggregate(bands: Iterable[float] = BANDS_PCT) -> dict:
+    """The same keys as LocalBook.aggregate, all zero and every band invalid.
+    Written while a book is resyncing, so a second without a valid book is a
+    row that says so rather than a hole that says nothing."""
+    row: dict = {k: 0.0 for k in ("best_bid", "best_ask", "best_bid_qty", "best_ask_qty",
+                                  "mid", "spread_bps", "covered_bid_pct", "covered_ask_pct")}
+    row["levels_bid"] = row["levels_ask"] = 0
+    for p in sorted(bands):
+        b = band_label(p)
+        for side in ("bid", "ask"):
+            row[f"depth_{side}_usd_{b}"] = 0.0
+            row[f"depth_{side}_usd_acc_{b}"] = 0.0
+            row[f"band_valid_{side}_{b}"] = 0
+    return row
+
+
 def _apply_side(side: dict[float, float], levels: Levels) -> None:
     for price, qty in levels:
         p, q = float(price), float(qty)

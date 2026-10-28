@@ -32,7 +32,7 @@ from .metrics import Statsd
 
 log = logging.getLogger("storage_probe")
 
-TABLES = ("mark_price", "trades", "liquidations", "open_interest")
+TABLES = ("mark_price", "trades", "liquidations", "open_interest", "book_agg")
 
 
 def ch_query(url: str, user: str, password: str, sql: str) -> list[dict]:

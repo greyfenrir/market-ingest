@@ -2,7 +2,7 @@ import math, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ingest.book import LocalBook, band_label
+from ingest.book import LocalBook, band_label, empty_aggregate
 
 fails = []
 def check(name, got, want):
@@ -126,6 +126,11 @@ close("same on asks",                              row["covered_ask_pct"], 2.0)
 b = book(bids=BIDS[:2], asks=ASKS[:2], limit=2)       # trusted to 0.4 %
 b.prune(2.0)
 close("prune never widens trust", b.aggregate()["covered_bid_pct"], 0.4)
+
+print("== empty_aggregate: same shape as a real row, all zero")
+real, empty = book(limit=5).aggregate(), empty_aggregate()
+check("same keys", set(real) ^ set(empty), set())
+check("all zero", {v for v in empty.values()}, {0})
 
 print("== determinism: same levels, same row, whatever the arrival order")
 a = book(limit=5)

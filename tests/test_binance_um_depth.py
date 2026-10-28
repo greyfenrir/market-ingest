@@ -1,0 +1,231 @@
+import asyncio, re, sys, time, types
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+try:
+    import websockets  # noqa: F401
+except ModuleNotFoundError:  # only imported at module level, never used here
+    sys.modules["websockets"] = types.ModuleType("websockets")
+
+from ingest.exchanges.binance_um import BinanceUM
+from ingest.exchanges.binance_um_depth import ALIGNING, LIVE, SYNCING, DepthSync
+
+fails = []
+def check(name, got, want):
+    if got == want: print(f"  PASS  {name}")
+    else: print(f"  FAIL  {name}: got {got!r}, want {want!r}"); fails.append(name)
+
+
+def ev(U, u, pu, b=(), a=(), sym="BTCUSDT", E=1_789_029_900_000):
+    return {"e": "depthUpdate", "E": E, "T": E - 1, "s": sym,
+            "U": U, "u": u, "pu": pu, "b": [list(x) for x in b], "a": [list(x) for x in a]}
+
+SNAP = {"lastUpdateId": 100,
+        "bids": [["99.9", "1"], ["99.6", "1"], ["99.0", "1"]],
+        "asks": [["100.1", "1"], ["100.4", "1"], ["101.0", "1"]]}
+
+
+print("== sequencing: buffer, snapshot, alignment (futures rule U <= L <= u)")
+s = DepthSync("BTCUSDT")
+check("starts needing a snapshot", (s.state, s.needs_snapshot), (SYNCING, True))
+s.on_event(ev(95, 98, 94))
+s.on_event(ev(99, 103, 98, b=[("99.9", "2")]))
+s.on_event(ev(104, 107, 103, b=[("99.95", "1")]))
+check("events buffered while syncing", len(s.buffer), 3)
+s.snapshot_pending = True
+check("pending snapshot is not requested twice", s.needs_snapshot, False)
+check("buffer aligns with snapshot", s.on_snapshot(SNAP), None)
+check("live after alignment", s.live, True)
+check("book at last buffered id", s.book.last_update_id, 107)
+check("event older than snapshot was dropped, spanning one applied",
+      (s.book.bids[99.9], s.book.best_bid()), (2.0, 99.95))
+check("buffer emptied", s.buffer, [])
+check("pu chain continues", s.on_event(ev(108, 110, 107, a=[("100.1", "0")])), None)
+check("delta applied live", s.book.best_ask(), 100.4)
+
+print("== sequencing: what forces a resync")
+s = DepthSync("BTCUSDT")
+s.on_event(ev(105, 110, 104))
+reason = s.on_snapshot(SNAP)
+check("buffer starting after the snapshot is a gap", reason.startswith("gap after snapshot"), True)
+check("gap leaves the book unsynced", (s.state, s.book.synced, s.needs_snapshot), (SYNCING, False, True))
+check("generation bumped", s.generation, 1)
+
+s = DepthSync("BTCUSDT")
+s.on_snapshot(SNAP)                                   # nothing buffered yet
+check("snapshot without buffer waits to align", (s.state, s.live), (ALIGNING, False))
+check("older event ignored while aligning", (s.on_event(ev(90, 99, 89)), s.state), (None, ALIGNING))
+check("spanning event goes live", (s.on_event(ev(100, 104, 99)), s.state), (None, LIVE))
+check("redelivered event is ignored", (s.on_event(ev(101, 104, 100)), s.state), (None, LIVE))
+reason = s.on_event(ev(108, 110, 106))
+check("pu mismatch is a sequence break", reason, "sequence break: pu=106, expected 104")
+check("break discards the book", (s.state, s.book.synced, s.book.bids), (SYNCING, False, {}))
+
+print("== sequencing: per-second counters")
+s = DepthSync("BTCUSDT")
+s.on_snapshot(SNAP)
+s.on_event(ev(100, 104, 99)); s.on_event(ev(105, 106, 104))
+check("counters for the second", s.take_second(),
+      {"seq_first": 100, "seq_last": 106, "n_updates": 2, "resynced": False})
+check("counters restart", s.take_second(),
+      {"seq_first": 0, "seq_last": 0, "n_updates": 0, "resynced": False})
+s.reset("test")
+check("a reset marks the second", s.take_second()["resynced"], True)
+
+class Tiny(DepthSync):
+    MAX_BUFFER = 3
+s = Tiny("BTCUSDT")
+for i in range(5):
+    s.on_event(ev(i * 10, i * 10 + 9, i * 10 - 1))
+check("buffer is capped, oldest dropped", [e["U"] for e in s.buffer], [20, 30, 40])
+
+
+# ------------------------------------------------------------------ connector
+
+class FakeSink:
+    insert_errors = dropped_rows = 0
+    def __init__(self): self.rows = []
+    def write(self, table, row): self.rows.append((table, row))
+    def queued_rows(self): return 0
+    def of(self, table): return [r for t, r in self.rows if t == table]
+
+class FakeStatsd:
+    def incr(self, *a, **k): pass
+    def gauge(self, *a, **k): pass
+
+def make(depth=None):
+    sink = FakeSink()
+    cfg = {"depth": {"enabled": True, "symbols": ["BTCUSDT"], **(depth or {})}}
+    return BinanceUM(cfg, sink, focus=["BTCUSDT", "ETHUSDT"], sd=FakeStatsd()), sink
+
+def feed(c, payload):
+    c._handle_depth(payload, payload["E"] + 5, 200, c._stat("depth"))
+
+def events(sink):
+    return [(r["event"], r["detail"]) for r in sink.of("ops.connection_events")]
+
+SEC = 1_789_029_900
+
+print("== connector: off unless enabled")
+check("no books by default", BinanceUM({}, FakeSink(), focus=["BTCUSDT"], sd=FakeStatsd()).depth, {})
+c, _ = make({"symbols": "focus"})
+check("'focus' takes the focus universe", sorted(c.depth), ["BTCUSDT", "ETHUSDT"])
+
+print("== connector: a row every second, valid or not")
+c, sink = make()
+c._emit_book_rows(SEC, time.monotonic())
+row = sink.of("market.book_agg")[-1]
+check("no snapshot yet: state resync", row["state"], "resync")
+check("zeros, not missing", (row["best_bid"], row["depth_bid_usd_1"], row["band_valid_bid_0p2"]), (0.0, 0.0, 0))
+check("event_time is the second", row["event_time"], "2026-09-10 08:45:00")
+
+sync = c.depth["BTCUSDT"]
+sync.on_snapshot({**SNAP, "bids": SNAP["bids"][:2], "asks": SNAP["asks"][:2]})  # shorter than limit: complete
+feed(c, ev(100, 104, 99, b=[("99.9", "3")]))
+c._emit_book_rows(SEC + 1, time.monotonic())
+row = sink.of("market.book_agg")[-1]
+check("live book: state ok", row["state"], "ok")
+check("figures from the book", (row["best_bid"], row["best_bid_qty"], row["best_ask"]), (99.9, 3.0, 100.1))
+check("update ids of the second", (row["seq_first"], row["seq_last"], row["n_updates"]), (100, 104, 1))
+c._last_mark["BTCUSDT"] = 200.0
+c._emit_book_rows(SEC + 2, time.monotonic())
+check("depth priced at mark", sink.of("market.book_agg")[-1]["depth_bid_usd_1"], 4 * 200.0)
+c._emit_book_rows(SEC + 3, time.monotonic() + 60)
+check("no delta for too long: stale", sink.of("market.book_agg")[-1]["state"], "stale")
+
+print("== connector: resyncs are logged and visible in the rows")
+feed(c, ev(110, 112, 109))
+check("sequence break logged", events(sink)[-1], ("resync", "BTCUSDT: sequence break: pu=109, expected 104"))
+c._emit_book_rows(SEC + 4, time.monotonic())
+check("broken book: state resync", sink.of("market.book_agg")[-1]["state"], "resync")
+sync.on_snapshot({**SNAP, "lastUpdateId": 200})
+feed(c, ev(200, 201, 199))
+c._emit_book_rows(SEC + 5, time.monotonic())
+check("recovered in a later second: ok", sink.of("market.book_agg")[-1]["state"], "ok")
+feed(c, ev(205, 206, 204))                             # break ...
+sync.on_snapshot({**SNAP, "lastUpdateId": 300})
+feed(c, ev(300, 301, 299))                             # ... and recovery, same second
+c._emit_book_rows(SEC + 6, time.monotonic())
+check("resynced within the second: degraded", sink.of("market.book_agg")[-1]["state"], "degraded")
+c._emit_book_rows(SEC + 7, time.monotonic())
+check("next clean second: ok", sink.of("market.book_agg")[-1]["state"], "ok")
+
+feed(c, ev(302, 302, 301, b=[("100.5", "1")]))        # bid above the best ask
+c._emit_book_rows(SEC + 8, time.monotonic())
+check("crossed book is resynced", events(sink)[-1], ("resync", "BTCUSDT: crossed book"))
+check("and not aggregated", sink.of("market.book_agg")[-1]["state"], "resync")
+
+feed(c, ev(5, 6, 4, sym="XRPUSDT"))
+check("symbol without a book is ignored", len(c.depth), 1)
+
+print("== connector: reconnect starts every live book over")
+c, sink = make()
+c._depth_on_open()
+check("first connect: nothing to report", events(sink), [])
+c.depth["BTCUSDT"].on_snapshot(SNAP); feed(c, ev(100, 104, 99))
+c._depth_on_open()
+check("live book reset on reconnect", (events(sink)[-1], c.depth["BTCUSDT"].state),
+      (("resync", "BTCUSDT: reconnect"), SYNCING))
+
+print("== connector: snapshot fetch obeys 429 and drops stale responses")
+class Resp:
+    def __init__(self, status, body=None, headers=None, on_json=None):
+        self.status, self.body, self.headers, self.on_json = status, body, headers or {}, on_json
+    async def json(self):
+        if self.on_json: self.on_json()
+        return self.body
+    async def text(self): return "nope"
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+class Rest:
+    def __init__(self, *resps): self.resps, self.calls = list(resps), 0
+    def get(self, url, params=None):
+        self.calls += 1
+        return self.resps.pop(0)
+
+def fetch(c, rest):
+    async def go():
+        real = asyncio.sleep
+        asyncio.sleep = lambda *_: real(0)      # skip backoff and Retry-After waits
+        try:
+            c._rest, c._snap_sem = rest, asyncio.Semaphore(1)
+            await c._fetch_snapshot(c.depth["BTCUSDT"])
+        finally:
+            asyncio.sleep = real
+    asyncio.run(go())
+
+c, sink = make()
+c.depth["BTCUSDT"].on_event(ev(99, 103, 98))
+fetch(c, Rest(Resp(429, headers={"Retry-After": "7"}), Resp(200, SNAP)))
+check("429 logged with its wait", events(sink)[0], ("rate_limit", "BTCUSDT HTTP 429, retry after 7s"))
+check("then synced", (events(sink)[-1][0], c.depth["BTCUSDT"].live), ("synced", True))
+
+c, sink = make()
+sync = c.depth["BTCUSDT"]
+rest = Rest(Resp(200, SNAP, on_json=lambda: sync.reset("reconnect")))
+fetch(c, rest)
+check("response for a reset book is discarded", (sync.state, sync.book.synced, rest.calls), (SYNCING, False, 1))
+
+c, sink = make()
+c.depth["BTCUSDT"].on_event(ev(150, 160, 149))       # buffer starts after the snapshot
+fetch(c, Rest(Resp(500), Resp(200, SNAP), Resp(200, {**SNAP, "lastUpdateId": 155})))
+check("error, misaligned, then aligned",
+      [e for e, _ in events(sink)], ["error", "resync", "synced"])
+
+print("== schema: row keys match market.book_agg exactly")
+# JSONEachRow rejects a whole batch over one unknown key, and the sink retries
+# a rejected batch forever, so a drift here would stall the table.
+sql = (ROOT / "schema" / "004_book.sql").read_text()
+body = sql[sql.index("CREATE TABLE"): sql.index("ENGINE")]
+columns = set(re.findall(r"^\s+(\w+)\s+(?:LowCardinality|DateTime|Float|UInt)", body, re.M))
+c, sink = make()
+c._emit_book_rows(SEC, time.monotonic())                  # zero row
+c.depth["BTCUSDT"].on_snapshot(SNAP); feed(c, ev(100, 104, 99))
+c._emit_book_rows(SEC + 1, time.monotonic())              # live row
+rows = sink.of("market.book_agg")
+check("zero row keys == columns", set(rows[0]) ^ columns, set())
+check("live row keys == columns", set(rows[1]) ^ columns, set())
+
+print()
+print("ALL PASSED" if not fails else f"FAILURES: {fails}")
+raise SystemExit(1 if fails else 0)

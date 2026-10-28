@@ -46,12 +46,32 @@ focus_symbols = [
 open_interest_poll_seconds = 60
 open_interest_symbols      = "focus"   # "focus" or "all"
 
+# Binance drops WebSocket connections after 24h. Beat it to the punch.
+# (Must stay above the first [binance_um.*] header: TOML would otherwise file
+# it under that table, where nothing reads it.)
+reconnect_after_hours = 23
+
 # A stream that goes quiet for longer than this is treated as broken and
 # reconnected. Silence is the failure mode that looks like success.
 [binance_um.stall_seconds]
 mark_price   = 30
 agg_trade    = 900
 force_order  = 7200
+depth        = 30
 
-# Binance drops WebSocket connections after 24h. Beat it to the punch.
-reconnect_after_hours = 23
+# Order book: a local book per symbol from a REST snapshot plus @depth deltas
+# on the /public route, written to market.book_agg as one row per second.
+# Raw deltas are not kept.
+[binance_um.depth]
+enabled                = true
+symbols                = "focus"   # "focus" or a list of symbols
+update_speed_ms        = 100       # 100 or 500
+# 1000 levels weigh 20 against the REST limit and reach only ~+-0.16 % on BTC;
+# bands beyond that are reported but flagged invalid.
+snapshot_limit         = 1000
+max_parallel_snapshots = 2
+# Levels further than this from mid are dropped: deltas add far levels and
+# nothing else ever removes them.
+prune_pct              = 10
+# A live book with no delta for this long is reported as stale.
+stale_seconds          = 5

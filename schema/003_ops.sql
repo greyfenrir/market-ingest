@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS ops.connection_events
     stream     LowCardinality(String),
     session_id UUID,
     -- start | open | subscribed | stall | close | error | reconnect | stop
+    -- order book: resync | synced | rate_limit
     event      LowCardinality(String),
     detail     String CODEC(ZSTD(3))
 )
