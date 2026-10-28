@@ -19,6 +19,9 @@ WorkingDirectory=/opt/market-ingest
 Environment=PYTHONPATH=/opt/market-ingest/src
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/market-ingest/env
+# COLLECTOR_VERSION, written by deploy.sh. Optional ("-"): a missing file means
+# rows carry an empty version, not that the collector refuses to start.
+EnvironmentFile=-/etc/market-ingest/version
 ExecStart=/opt/market-ingest/.venv/bin/python -m ingest \
     --config /etc/market-ingest/config.toml \
     --exchange %i

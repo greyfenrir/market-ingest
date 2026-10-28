@@ -41,6 +41,9 @@ async def amain(args) -> int:
     ch = cfg.get("clickhouse", {})
     ing = cfg.get("ingest", {})
 
+    logging.info("%s collector, version %s", args.exchange,
+                 os.environ.get("COLLECTOR_VERSION") or "unset")
+
     password = os.environ.get("CH_PASSWORD")
     if not password:
         print("CH_PASSWORD is not set (expected from the systemd EnvironmentFile)",

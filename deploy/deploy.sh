@@ -58,6 +58,24 @@ else
     "$HERE"/{src,schema,deploy,requirements.txt} "$HOST:$DEST/"
 fi
 
+# Record which code is about to run. Rows the collector computes rather than
+# copies (market.book_agg) cannot be recomputed later - raw deltas are not kept
+# - so the version stamped on each row is the only way to tell the output of
+# one algorithm from another. It lives in its own file, not in env:
+# setup_ch_user.sh rewrites env wholesale, and would wipe it.
+if [[ "$MODE" == "--git" ]]; then
+  VERSION="$(ssh "$HOST" "sudo -u ingest git -C $DEST rev-parse --short=12 HEAD")"
+else
+  VERSION="$(git -C "$HERE" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+  # rsync ships the working tree, not HEAD: say so when they differ, so a row
+  # from uncommitted code is never mistaken for a row from that commit.
+  if [[ -n "$(git -C "$HERE" status --porcelain -- src schema deploy requirements.txt 2>/dev/null)" ]]; then
+    VERSION="${VERSION}-dirty"
+  fi
+fi
+say "collector version $VERSION"
+ssh "$HOST" "printf 'COLLECTOR_VERSION=%s\n' '$VERSION' | sudo tee $ETC/version >/dev/null && sudo chmod 0644 $ETC/version"
+
 # --no-cache-dir below: the service account has no home by design, so pip has
 # nowhere to put a cache and says so noisily on every single deploy. The
 # dependency set is two small wheels; the cache was never buying anything.
