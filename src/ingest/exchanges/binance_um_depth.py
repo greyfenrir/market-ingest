@@ -57,7 +57,11 @@ class DepthSync:
 
     @property
     def needs_snapshot(self) -> bool:
-        return self.state == SYNCING and not self.snapshot_pending
+        """Only once the stream has buffered something. A snapshot taken
+        before the first event can predate the start of the stream, and then
+        no event spans it: Binance's own procedure is buffer first, snapshot
+        second."""
+        return self.state == SYNCING and not self.snapshot_pending and bool(self.buffer)
 
     def on_event(self, ev: dict, mono: float = 0.0) -> str | None:
         """Feed one depthUpdate. Returns the reason if it broke the sequence;
@@ -87,13 +91,17 @@ class DepthSync:
     def reset(self, reason: str) -> str:
         """Discard the book. Also called by the connector, on reconnect or on a
         crossed book: either way nothing in it can be trusted any more."""
+        # Only a book that had a snapshot loses anything. Resetting one that
+        # was still waiting for its first snapshot (every book at startup)
+        # must not flag its first live second as degraded.
+        if self.state != SYNCING:
+            self.resynced = True
         self.book.invalidate()
         self.state = SYNCING
         self.buffer = []
         self.snapshot_pending = False
         self.generation += 1
         self.resyncs += 1
-        self.resynced = True
         return reason
 
     def take_second(self) -> dict:

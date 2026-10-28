@@ -27,8 +27,9 @@ SNAP = {"lastUpdateId": 100,
 
 print("== sequencing: buffer, snapshot, alignment (futures rule U <= L <= u)")
 s = DepthSync("BTCUSDT")
-check("starts needing a snapshot", (s.state, s.needs_snapshot), (SYNCING, True))
+check("starts syncing, no snapshot before any event", (s.state, s.needs_snapshot), (SYNCING, False))
 s.on_event(ev(95, 98, 94))
+check("first buffered event asks for one", s.needs_snapshot, True)
 s.on_event(ev(99, 103, 98, b=[("99.9", "2")]))
 s.on_event(ev(104, 107, 103, b=[("99.95", "1")]))
 check("events buffered while syncing", len(s.buffer), 3)
@@ -48,8 +49,10 @@ s = DepthSync("BTCUSDT")
 s.on_event(ev(105, 110, 104))
 reason = s.on_snapshot(SNAP)
 check("buffer starting after the snapshot is a gap", reason.startswith("gap after snapshot"), True)
-check("gap leaves the book unsynced", (s.state, s.book.synced, s.needs_snapshot), (SYNCING, False, True))
+check("gap leaves the book unsynced", (s.state, s.book.synced, s.buffer), (SYNCING, False, []))
 check("generation bumped", s.generation, 1)
+s.on_event(ev(111, 112, 110))
+check("and the next event asks for a new snapshot", s.needs_snapshot, True)
 
 s = DepthSync("BTCUSDT")
 s.on_snapshot(SNAP)                                   # nothing buffered yet
@@ -71,6 +74,8 @@ check("counters restart", s.take_second(),
       {"seq_first": 0, "seq_last": 0, "n_updates": 0, "resynced": False})
 s.reset("test")
 check("a reset marks the second", s.take_second()["resynced"], True)
+s.reset("test again")                                 # already waiting for a snapshot
+check("resetting a book that had none does not", s.take_second()["resynced"], False)
 
 class Tiny(DepthSync):
     MAX_BUFFER = 3
@@ -189,6 +194,7 @@ def fetch(c, rest):
         asyncio.sleep = lambda *_: real(0)      # skip backoff and Retry-After waits
         try:
             c._rest, c._snap_sem = rest, asyncio.Semaphore(1)
+            c._depth_open = True
             await c._fetch_snapshot(c.depth["BTCUSDT"])
         finally:
             asyncio.sleep = real
@@ -211,6 +217,71 @@ c.depth["BTCUSDT"].on_event(ev(150, 160, 149))       # buffer starts after the s
 fetch(c, Rest(Resp(500), Resp(200, SNAP), Resp(200, {**SNAP, "lastUpdateId": 155})))
 check("error, misaligned, then aligned",
       [e for e, _ in events(sink)], ["error", "resync", "synced"])
+
+print("== connector: snapshots wait for an open stream")
+def scheduler_pass(c):
+    started = []
+    async def fake_fetch(sync):
+        started.append(sync.symbol)
+    c._fetch_snapshot = fake_fetch
+    async def go():
+        n = c._depth_request_snapshots()
+        await asyncio.sleep(0)                  # let the started tasks run
+        return n
+    return asyncio.run(go()), started
+
+c, sink = make()
+c.depth["BTCUSDT"].on_event(ev(99, 103, 98))   # something buffered, but no stream
+check("closed stream: nothing requested", scheduler_pass(c), (0, []))
+c._depth_on_open()
+check("open resets the book, so still nothing to align", scheduler_pass(c), (0, []))
+c.depth["BTCUSDT"].on_event(ev(99, 103, 98))
+check("open and buffering: requested", scheduler_pass(c), (1, ["BTCUSDT"]))
+check("pending: not requested twice", scheduler_pass(c), (0, []))
+c._depth_on_close()
+c.depth["BTCUSDT"].reset("test"); c.depth["BTCUSDT"].on_event(ev(99, 103, 98))
+check("closed again: nothing requested", scheduler_pass(c), (0, []))
+
+c, sink = make()
+c.depth["BTCUSDT"].on_event(ev(99, 103, 98))
+rest = Rest(Resp(200, SNAP))
+async def fetch_closed():
+    c._rest, c._snap_sem = rest, asyncio.Semaphore(1)
+    await c._fetch_snapshot(c.depth["BTCUSDT"])  # _depth_open is False
+asyncio.run(fetch_closed())
+check("a fetch gives up while the stream is closed", (rest.calls, c.depth["BTCUSDT"].live), (0, False))
+
+print("== ws loop: on_open and on_close bracket every attempt")
+import ingest.exchanges.binance_um as bu
+class WS:
+    async def recv(self): raise RuntimeError("dropped")
+class Conn:
+    def __init__(self, fail): self.fail = fail
+    async def __aenter__(self):
+        if self.fail: raise OSError("refused")
+        return WS()
+    async def __aexit__(self, *a): return False
+def one_attempt(fail):
+    c, sink = make()
+    calls = []
+    real_connect, real_sleep = getattr(bu.websockets, "connect", None), asyncio.sleep
+    bu.websockets.connect = lambda *a, **k: Conn(fail)
+    async def stop(*_): raise asyncio.CancelledError   # end the loop at the backoff
+    asyncio.sleep = stop
+    async def go():
+        try:
+            await c._ws_loop("depth", "wss://x", lambda *a: None,
+                             on_open=lambda: calls.append("open"),
+                             on_close=lambda: calls.append("close"))
+        except asyncio.CancelledError:
+            pass
+    try:
+        asyncio.run(go())
+    finally:
+        bu.websockets.connect, asyncio.sleep = real_connect, real_sleep
+    return calls
+check("connected then dropped", one_attempt(fail=False), ["open", "close"])
+check("never connected: close only", one_attempt(fail=True), ["close"])
 
 print("== schema: row keys match market.book_agg exactly")
 # JSONEachRow rejects a whole batch over one unknown key, and the sink retries

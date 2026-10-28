@@ -95,6 +95,10 @@ class BinanceUM:
         self._rest: aiohttp.ClientSession | None = None
         self._snap_sem: asyncio.Semaphore | None = None
         self._bg: set[asyncio.Task] = set()
+        # True while the depth WebSocket is connected. A snapshot taken with no
+        # stream behind it has no events to align with and is thrown away by
+        # the reset at the next open - 20 weight per book, every start.
+        self._depth_open = False
 
     # ------------------------------------------------------------------ util
 
@@ -131,12 +135,12 @@ class BinanceUM:
 
     # ------------------------------------------------------------ ws plumbing
 
-    async def _ws_loop(self, stream: str, url: str, handle, on_open=None) -> None:
+    async def _ws_loop(self, stream: str, url: str, handle, on_open=None, on_close=None) -> None:
         """Connect, consume, and never give up. Backoff is exponential with
         jitter so that a Binance-side outage does not turn our reconnects into
         a self-inflicted IP ban. on_open runs on every (re)connect, before the
         first message: state that does not survive a new connection is reset
-        there."""
+        there. on_close runs whenever an attempt ends, connected or not."""
         attempt = 0
         while True:
             started = time.monotonic()
@@ -160,6 +164,9 @@ class BinanceUM:
             except Exception as exc:  # noqa: BLE001
                 self._event(stream, "error", f"{type(exc).__name__}: {exc}")
                 log.warning("%s error: %s", stream, exc)
+            finally:
+                if on_close:
+                    on_close()
             # Keep the sequence state: the jump across this reconnect is the
             # measurement of what the outage cost us.
             self.seq.mark_reconnect()
@@ -329,6 +336,13 @@ class BinanceUM:
             sync.reset("reconnect")
             if was != SYNCING:
                 self._depth_resync(sync, "reconnect")
+        self._depth_open = True
+
+    def _depth_on_close(self) -> None:
+        """No stream, no snapshots: they could not be aligned with anything.
+        Books keep their last state until the next open resets them, and the
+        per-second rows report them as stale meanwhile."""
+        self._depth_open = False
 
     def _handle_depth(self, payload, recv_ms: float, nbytes: int, st: StreamStats) -> None:
         if payload.get("e") != "depthUpdate":
@@ -349,14 +363,23 @@ class BinanceUM:
         from the message handler so that handling a message never has to
         spawn tasks, and so that a burst of resyncs is paced by one place."""
         while True:
-            for sync in self.depth.values():
-                if sync.needs_snapshot:
-                    sync.snapshot_pending = True
-                    t = asyncio.create_task(self._fetch_snapshot(sync),
-                                            name=f"snapshot:{sync.symbol}")
-                    self._bg.add(t)
-                    t.add_done_callback(self._bg.discard)
+            self._depth_request_snapshots()
             await asyncio.sleep(0.2)
+
+    def _depth_request_snapshots(self) -> int:
+        """One pass of the scheduler. Returns how many fetches it started."""
+        if not self._depth_open:
+            return 0
+        started = 0
+        for sync in self.depth.values():
+            if sync.needs_snapshot:
+                sync.snapshot_pending = True
+                t = asyncio.create_task(self._fetch_snapshot(sync),
+                                        name=f"snapshot:{sync.symbol}")
+                self._bg.add(t)
+                t.add_done_callback(self._bg.discard)
+                started += 1
+        return started
 
     async def _fetch_snapshot(self, sync: DepthSync) -> None:
         """Fetch /fapi/v1/depth until it aligns with the buffered events.
@@ -364,14 +387,17 @@ class BinanceUM:
         A 1000-level snapshot weighs 20, and at most `max_parallel_snapshots`
         are in flight, so a mass reconnect of every book costs a few hundred
         weight spread over seconds rather than one burst. 429 and 418 are
-        obeyed: Binance turns ignored 429s into an IP ban."""
+        obeyed: Binance turns ignored 429s into an IP ban.
+
+        Gives up as soon as the stream closes. snapshot_pending stays set, and
+        the reset at the next open clears it and lets the scheduler start over."""
         assert self._rest is not None and self._snap_sem is not None
         gen = sync.generation
         delay = 1.0
-        while sync.generation == gen:
+        while sync.generation == gen and self._depth_open:
             snap = None
             async with self._snap_sem:
-                if sync.generation != gen:
+                if sync.generation != gen or not self._depth_open:
                     return
                 try:
                     async with self._rest.get(
@@ -580,7 +606,8 @@ class BinanceUM:
             tasks += [
                 asyncio.create_task(
                     self._ws_loop("depth", f"{WS_PUBLIC}/stream?streams={depth_streams}",
-                                  self._handle_depth, on_open=self._depth_on_open),
+                                  self._handle_depth, on_open=self._depth_on_open,
+                                  on_close=self._depth_on_close),
                     name="depth"),
                 asyncio.create_task(self._depth_snapshot_loop(), name="depth_snapshots"),
                 asyncio.create_task(self._depth_tick_loop(), name="depth_tick"),
