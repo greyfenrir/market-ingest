@@ -204,6 +204,14 @@ c._emit_book_rows(SEC + 8, time.monotonic())
 check("crossed book is resynced", events(sink)[-1], ("resync", "BTCUSDT: crossed book"))
 check("and not aggregated", sink.of("market.book_agg")[-1]["state"], "resync")
 
+c, sink = make()
+sync = c.depth["BTCUSDT"]
+sync.on_snapshot(SNAP); feed(c, ev(100, 104, 99))
+feed(c, ev(105, 105, 104, a=[(f"{p}", "0") for p in sync.book.asks]))   # every ask lifted
+c._emit_book_rows(SEC + 9, time.monotonic())                            # used to raise TypeError
+check("empty side is resynced, not a crash", events(sink)[-1], ("resync", "BTCUSDT: empty side"))
+check("and recorded as resync", sink.of("market.book_agg")[-1]["state"], "resync")
+
 feed(c, ev(5, 6, 4, sym="XRPUSDT"))
 check("symbol without a book is ignored", len(c.depth), 1)
 
@@ -235,7 +243,10 @@ class Rest:
 def fetch(c, rest):
     async def go():
         real = asyncio.sleep
-        asyncio.sleep = lambda *_: real(0)      # skip backoff and Retry-After waits
+        def skip(*_):                           # skip backoff and Retry-After waits
+            c._rest_pause_until = 0.0
+            return real(0)
+        asyncio.sleep = skip
         try:
             c._rest, c._snap_sem = rest, asyncio.Semaphore(1)
             c._depth_open = True
@@ -249,6 +260,22 @@ c.depth["BTCUSDT"].on_event(ev(99, 103, 98))
 fetch(c, Rest(Resp(429, headers={"Retry-After": "7"}), Resp(200, SNAP)))
 check("429 logged with its wait", events(sink)[0], ("rate_limit", "BTCUSDT HTTP 429, retry after 7s"))
 check("then synced", (events(sink)[-1][0], c.depth["BTCUSDT"].live), ("synced", True))
+
+print("== connector: a 429 pauses every REST caller, not just the one that got it")
+c, sink = make()
+t = time.monotonic()
+c._rest_pause("depth", "BTCUSDT", 429, {"Retry-After": "7"})
+check("pause is shared and lasts Retry-After", round(c._rest_pause_until - t), 7)
+c._rest_pause("open_interest", "ETHUSDT", 418, {"Retry-After": "2"})
+check("a shorter pause does not cut a longer one", round(c._rest_pause_until - t), 7)
+c._rest_pause("depth", "BTCUSDT", 429, {"Retry-After": "soon"})
+check("unreadable Retry-After waits 60 s", round(c._rest_pause_until - t), 60)
+c._rest_pause_until = time.monotonic() + 0.2
+async def timed_wait():
+    t0 = time.monotonic(); await c._rest_wait(); return time.monotonic() - t0
+check("callers wait out the pause", asyncio.run(timed_wait()) >= 0.19, True)
+c._rest_pause_until = 0.0
+check("no pause, no wait", asyncio.run(timed_wait()) < 0.05, True)
 
 c, sink = make()
 sync = c.depth["BTCUSDT"]

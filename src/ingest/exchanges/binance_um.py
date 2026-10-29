@@ -109,8 +109,28 @@ class BinanceUM:
         # stream behind it has no events to align with and is thrown away by
         # the reset at the next open - 20 weight per book, every start.
         self._depth_open = False
+        # Binance limits REST by IP, so a 429/418 is a pause for every REST
+        # caller here, not just the one that got it (monotonic seconds).
+        self._rest_pause_until = 0.0
 
     # ------------------------------------------------------------------ util
+
+    async def _rest_wait(self) -> None:
+        """Hold a REST call until any pause ordered by a 429/418 is over."""
+        while (left := self._rest_pause_until - time.monotonic()) > 0:
+            await asyncio.sleep(left)
+
+    def _rest_pause(self, stream: str, what: str, status: int, headers) -> None:
+        """Obey a 429/418 for every REST caller: Binance turns requests sent
+        after a 429 into an IP ban, and a ban into a longer one."""
+        try:
+            wait = float(headers.get("Retry-After") or 60)
+        except ValueError:
+            wait = 60.0
+        self._rest_pause_until = max(self._rest_pause_until, time.monotonic() + wait)
+        self._event(stream, "rate_limit", f"{what} HTTP {status}, retry after {wait:.0f}s")
+        log.error("REST rate-limited (HTTP %d on %s), pausing all REST for %.0fs",
+                  status, what, wait)
 
     def _stat(self, stream: str) -> StreamStats:
         st = self.stats.get(stream)
@@ -430,6 +450,7 @@ class BinanceUM:
         while wanted():
             snap = None
             async with self._snap_sem:
+                await self._rest_wait()
                 if not wanted():
                     return
                 try:
@@ -438,14 +459,9 @@ class BinanceUM:
                         params={"symbol": sync.symbol, "limit": self.depth_limit},
                     ) as r:
                         if r.status in (418, 429):
-                            # Sleeping while holding the slot pauses the other
-                            # snapshots too, which is the point.
-                            wait = float(r.headers.get("Retry-After") or 60)
-                            self._event("depth", "rate_limit",
-                                        f"{sync.symbol} HTTP {r.status}, retry after {wait:.0f}s")
-                            log.error("depth snapshot rate-limited (HTTP %d), pausing %.0fs",
-                                      r.status, wait)
-                            await asyncio.sleep(wait)
+                            # the next pass waits in _rest_wait, as does
+                            # every other snapshot and the OI poll
+                            self._rest_pause("depth", sync.symbol, r.status, r.headers)
                             continue
                         if r.status != 200:
                             raise RuntimeError(f"HTTP {r.status}: {(await r.text())[:200]}")
@@ -514,7 +530,12 @@ class BinanceUM:
                     self._depth_resync(sync, sync.reset("crossed book"))
                 else:
                     agg = sync.book.aggregate(BANDS_PCT, mark=self._last_mark.get(sync.symbol))
-                    self._depth_maybe_refresh(sync, agg, mono)
+                    if agg is None:
+                        # live but a side is empty: nothing to measure, and no
+                        # delta will refill a side the book has lost track of
+                        self._depth_resync(sync, sync.reset("empty side"))
+                    else:
+                        self._depth_maybe_refresh(sync, agg, mono)
             if agg is None:
                 state = "resync"
             elif counters["resynced"] or not agg["covered_bid_pct"] or not agg["covered_ask_pct"]:
@@ -572,8 +593,12 @@ class BinanceUM:
                 symbols = sorted(self.focus) if which == "focus" else sorted(self.focus)
                 t0 = time.monotonic()
                 for sym in symbols:
+                    await self._rest_wait()
                     try:
                         async with s.get(f"{REST}/fapi/v1/openInterest", params={"symbol": sym}) as r:
+                            if r.status in (418, 429):
+                                self._rest_pause("open_interest", sym, r.status, r.headers)
+                                continue
                             if r.status != 200:
                                 self._event("open_interest", "error", f"{sym} HTTP {r.status}")
                                 continue
