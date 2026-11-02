@@ -1,4 +1,4 @@
-import asyncio, sys
+import asyncio, datetime, json, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -11,24 +11,67 @@ def check(name, got, want):
 
 
 class FakeResp:
-    def __init__(self, status): self.status = status
+    def __init__(self, status, raise_exc=None):
+        self.status = status
+        self.raise_exc = raise_exc
+        # ClickHouse names the error in a header; 27 = CANNOT_PARSE_INPUT_ASSERTION_FAILED
+        self.headers = {"X-ClickHouse-Exception-Code": "27"} if status == 400 else {}
     async def text(self): return "boom"
-    async def __aenter__(self): return self
+    async def __aenter__(self):
+        if self.raise_exc: raise self.raise_exc
+        return self
     async def __aexit__(self, *a): return False
 
 
 class FakeSession:
-    """Records POST bodies; answers with the queued statuses, then 200."""
+    """Records POST bodies. Answers, in order: the queued statuses (an
+    exception instance stands for a network failure), then 400 for any body
+    holding a row marked "bad", else 200 - which is what ClickHouse does: one
+    bad row and the whole insert is refused."""
     def __init__(self, statuses=()):
         self.statuses = list(statuses)
         self.bodies = []
+        self.ok = []        # per body: did "ClickHouse" accept it
     def post(self, url, params=None, data=None):
-        self.bodies.append(data.decode())
-        return FakeResp(self.statuses.pop(0) if self.statuses else 200)
+        body = data.decode()
+        self.bodies.append(body)
+        if self.statuses:
+            s = self.statuses.pop(0)
+            resp = FakeResp(0, raise_exc=s) if isinstance(s, Exception) else FakeResp(s)
+        else:
+            resp = FakeResp(400 if '"bad":true' in body else 200)
+        self.ok.append(resp.status == 200)
+        return resp
 
 
 def make(**kw):
     return ClickHouseSink("http://x", "u", "p", **kw)
+
+
+def run(coro):
+    """Run with the 1 s pause after a failed insert cut to nothing."""
+    async def wrapped():
+        real = asyncio.sleep
+        asyncio.sleep = lambda *_: real(0)
+        try:
+            return await coro
+        finally:
+            asyncio.sleep = real
+    return asyncio.run(wrapped())
+
+
+def accepted(session):
+    """Row ids that went in, in the order they went in."""
+    return [json.loads(line)["i"] for body, ok in zip(session.bodies, session.ok) if ok
+            for line in body.split("\n")]
+
+
+def sink_with(rows, statuses=(), batch=100):
+    s = make(batch_max_rows=batch)
+    s._session = FakeSession(statuses)
+    for r in rows:
+        s.write("t", r)
+    return s
 
 
 print("== queue overflow drops the OLDEST rows and counts them")
@@ -39,28 +82,88 @@ check("kept newest three", [r["i"] for r in s._queues["t"]], [2, 3, 4])
 check("drops counted",     s.dropped_rows, 2)
 
 print("== failed insert is requeued at the front, order intact")
-s = make(batch_max_rows=2)
-s._session = FakeSession(statuses=[500])
-for i in range(4):
-    s.write("t", {"i": i})
+s = sink_with([{"i": i} for i in range(4)], statuses=[500], batch=2)
 async def failing_then_ok():
     q = s._queues["t"]
-    real = asyncio.sleep  # skip the 1s pause after a failed insert
-    asyncio.sleep = lambda *_: real(0)
-    try:
-        first = await s._flush("t", q)
-        after_fail = [r["i"] for r in q]
-        second = await s._flush("t", q)
-    finally:
-        asyncio.sleep = real
+    first = await s._flush("t", q)
+    after_fail = [r["i"] for r in q]
+    second = await s._flush("t", q)
     return first, after_fail, second
-first, after_fail, second = asyncio.run(failing_then_ok())
+first, after_fail, second = run(failing_then_ok())
 check("failure reported",      first, False)
 check("error counted",         s.insert_errors, 1)
 check("nothing lost, in order", after_fail, [0, 1, 2, 3])
 check("retry succeeds",        second, True)
 check("retry sent oldest rows", s._session.bodies[1], '{"i":0}\n{"i":1}')
 check("inserted counted",      s.inserted_rows, 2)
+
+print("== every failure outside the data waits: 401 403 404 408 500 503, network")
+for status in (401, 403, 404, 408, 500, 503, ConnectionResetError("reset")):
+    s = sink_with([{"i": 0}, {"i": 1}], statuses=[status])
+    settled = run(s._flush("t", s._queues["t"]))
+    name = status if isinstance(status, int) else type(status).__name__
+    check(f"{name}: requeued, nothing dropped",
+          (settled, [r["i"] for r in s._queues["t"]], s.dropped_rows), (False, [0, 1], 0))
+
+print("== 400: one bad row no longer blocks the table")
+rows = [{"i": i} for i in range(8)]
+rows[5]["bad"] = True
+s = sink_with(rows)
+settled = run(s._flush("t", s._queues["t"]))
+check("batch settled",            settled, True)
+check("queue is free",            len(s._queues["t"]), 0)
+check("good rows all inserted",   sorted(accepted(s._session)), [0, 1, 2, 3, 4, 6, 7])
+check("no good row sent twice",   len(accepted(s._session)), 7)
+check("inserted counted",         s.inserted_rows, 7)
+check("only the bad row dropped", (s.rejected_rows, s.dropped_rows), (1, 1))
+check("one error per rejected batch", s.insert_errors, 1)
+# 1 full + 2 per level for log2(8) = 3 levels
+check("cheap: 2*log2(n)+1 inserts", len(s._session.bodies), 7)
+
+print("== 400 on every row: dropped after one split, not one request per row")
+s = sink_with([{"i": i, "bad": True} for i in range(1000)], batch=1000)
+run(s._flush("t", s._queues["t"]))
+check("all dropped",  (s.rejected_rows, s.dropped_rows, s.inserted_rows), (1000, 1000, 0))
+check("3 inserts",    len(s._session.bodies), 3)
+
+print("== 400 on a single-row batch")
+s = sink_with([{"i": 0, "bad": True}])
+run(s._flush("t", s._queues["t"]))
+check("dropped with one request", (s.rejected_rows, len(s._session.bodies)), (1, 1))
+
+print("== a row that is not even JSON is isolated the same way")
+s = sink_with([{"i": 0}, {"i": 1, "t": datetime.datetime(2026, 11, 2)}, {"i": 2}, {"i": 3}])
+settled = run(s._flush("t", s._queues["t"]))
+check("sink survives, batch settled", settled, True)
+check("serialisable rows inserted",   sorted(accepted(s._session)), [0, 2, 3])
+check("bad row dropped",              s.rejected_rows, 1)
+
+print("== the database failing midway through a salvage loses nothing")
+rows = [{"i": i} for i in range(4)]
+rows[3]["bad"] = True
+# full batch refused, then the left half [0, 1] hits a network error
+s = sink_with(rows, statuses=[400, ConnectionResetError("reset")])
+settled = run(s._flush("t", s._queues["t"]))
+check("not settled",             settled, False)
+check("every row back, in order", [r["i"] for r in s._queues["t"]], [0, 1, 2, 3])
+check("nothing dropped",          s.dropped_rows, 0)
+# full batch refused, left half [0, 1] goes in, right half [2, 3] hits a 503
+s = sink_with(rows, statuses=[400, 200, 503])
+settled = run(s._flush("t", s._queues["t"]))
+check("only the unsettled half back", [r["i"] for r in s._queues["t"]], [2, 3])
+check("inserted half counted",        s.inserted_rows, 2)
+check("a retry finishes the job",     run(s._flush("t", s._queues["t"])), True)
+check("then the bad row is dropped, the good one in",
+      (s.rejected_rows, s.inserted_rows, len(s._queues["t"])), (1, 3, 0))
+
+print("== shutdown drain gets past a rejected batch")
+rows = [{"i": i} for i in range(6)]
+rows[0]["bad"] = True
+s = sink_with(rows, batch=2)
+s._stop.set()
+run(s._run())
+check("drain finished, queue empty", len(s._queues["t"]), 0)
+check("rows behind the bad one went in", sorted(accepted(s._session)), [1, 2, 3, 4, 5])
 
 print()
 print("ALL PASSED" if not fails else f"FAILURES: {fails}")
