@@ -93,6 +93,10 @@ ORDER BY (exchange, symbol, event_time);
 -- Open interest has no WebSocket stream on Binance; it is polled over REST.
 -- It is also the weight in "median across 9 exchanges weighted by OI", so it is
 -- not optional decoration.
+-- open_interest is one side (longs = shorts), in the base coin, for every
+-- venue. Some venues report both sides summed (Bybit openInterest, Gate
+-- total_size, possibly Bitget and HTX): connectors halve or pick the
+-- single-side field, and keep the venue's own figures in extra.
 CREATE TABLE IF NOT EXISTS market.open_interest
 (
     exchange      LowCardinality(String),

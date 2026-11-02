@@ -128,12 +128,17 @@ check("row keys == market.liquidations columns",
 print("== REST tickers: OI for focus, sampled mark for the rest")
 c, sink = make()
 c._write_tickers({"time": T0, "result": {"list": [
-    {"symbol": "BTCUSDT", "markPrice": "77771.9", "openInterest": "68660.162", "openInterestValue": "5339831253.05"},
+    # a live ticker of 2026-11-02: openInterest is both sides, single is one
+    {"symbol": "BTCUSDT", "markPrice": "78040.1", "openInterest": "69080.633",
+     "openInterestValue": "5390691307.61", "singleOpenInterest": "34540.317",
+     "singleOpenInterestValue": "2695345692.82"},
     {"symbol": "PEPEUSDT", "markPrice": "0.00001", "openInterest": "1e12", "fundingRate": "0.0001"},
 ]}}, T0 + 40, "focus", c._stat("open_interest"))
-check("OI only for focus", [(r["symbol"], r["open_interest"]) for r in sink.of("market.open_interest")],
-      [("BTCUSDT", 68660.162)])
-check("OI value kept", json.loads(sink.of("market.open_interest")[0]["extra"]), {"openInterestValue": "5339831253.05"})
+check("OI only for focus, one side", [(r["symbol"], r["open_interest"]) for r in sink.of("market.open_interest")],
+      [("BTCUSDT", 34540.317)])
+check("Bybit's own OI figures kept", json.loads(sink.of("market.open_interest")[0]["extra"]),
+      {"openInterest": "69080.633", "openInterestValue": "5390691307.61",
+       "singleOpenInterestValue": "2695345692.82"})
 marks = sink.of("market.mark_price")
 check("non-focus mark, sampled", [(r["symbol"], r["sampled"]) for r in marks], [("PEPEUSDT", 1)])
 check("row keys == market.open_interest columns",
@@ -141,7 +146,17 @@ check("row keys == market.open_interest columns",
 c, sink = make()
 c._write_tickers({"time": T0, "result": {"list": [{"symbol": "PEPEUSDT", "openInterest": "5"}]}},
                  T0, "all", c._stat("open_interest"))
-check("'all' takes OI for every symbol", len(sink.of("market.open_interest")), 1)
+rows = sink.of("market.open_interest")
+check("'all' takes OI for every symbol", len(rows), 1)
+check("no single-side field: half of both sides, flagged",
+      (rows[0]["open_interest"], json.loads(rows[0]["extra"])),
+      (2.5, {"openInterest": "5", "derived": "openInterest/2"}))
+c, sink = make()
+c._write_tickers({"time": T0, "result": {"list": [
+    {"symbol": "BTCUSDT", "openInterest": "8", "singleOpenInterest": ""}]}},
+    T0, "focus", c._stat("open_interest"))
+check("empty single-side field counts as missing",
+      sink.of("market.open_interest")[0]["open_interest"], 4.0)
 
 print("== REST errors: retCode is checked, 10006 pauses everything")
 class Rest:

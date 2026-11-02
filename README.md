@@ -104,6 +104,9 @@ wss://fstream.binance.com/market/ws/btcusdt@aggTrade  работает
   минуты, строк нет.
 - Open interest и mark price неосновных символов — один запрос
   `/v5/market/tickers` в минуту.
+- `openInterest` у Bybit — сумма обеих сторон, ровно вдвое больше, чем OI
+  у Binance. В `open_interest` пишется односторонний `singleOpenInterest`;
+  собственные цифры Bybit лежат в `extra`.
 
 ## Контроль качества
 

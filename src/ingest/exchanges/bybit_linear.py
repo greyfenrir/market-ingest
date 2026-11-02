@@ -20,7 +20,8 @@ open_interest), so ops tables and alarms read the same for every venue:
     force_order    allLiquidation.<sym>   every liquidation, not a sample
     depth          orderbook.1000.<sym>   snapshot + deltas on the socket
     open_interest  GET /v5/market/tickers once a minute: OI for the focus
-                   symbols, and the sampled mark price of everything else
+                   symbols (one side, singleOpenInterest - openInterest
+                   counts both), and the sampled mark price of everything else
 """
 
 from __future__ import annotations
@@ -377,19 +378,35 @@ class BybitLinear(Collector):
                 self.sink.write("market.mark_price", self._mark_row(t, ts, recv_ms, sampled=1))
                 marks += 1
             if which == "all" or sym in self.focus:
-                self.sink.write("market.open_interest", {
-                    "exchange": EXCHANGE,
-                    "symbol": sym,
-                    "event_time": ch_ts(ts),
-                    "ingest_time": ch_ts(recv_ms),
-                    "open_interest": _f(t.get("openInterest")),
-                    "extra": json.dumps({"openInterestValue": t.get("openInterestValue", "")},
-                                        separators=(",", ":")),
-                })
+                self.sink.write("market.open_interest", self._oi_row(t, ts, recv_ms))
                 ois += 1
         st.observe(nbytes=0, rows=ois, lag_ms=int(recv_ms - ts), symbol=None)
         self._count_rows("mark_price", marks)
         self._count_rows("open_interest", ois)
+
+    @staticmethod
+    def _oi_row(t: dict, ts: float, recv_ms: float) -> dict:
+        """Open interest of one side, in the base coin, as Binance reports it.
+        Bybit's openInterest is "the sum of both sides", exactly twice that:
+        taken as is, it would double Bybit's weight in an OI-weighted median.
+        singleOpenInterest exists since 2026-06-11. A ticker without it gets
+        half the two-sided figure, which is the same number, flagged in extra."""
+        single = t.get("singleOpenInterest")
+        extra = {k: t[k] for k in ("openInterest", "openInterestValue", "singleOpenInterestValue")
+                 if k in t}
+        if single in (None, ""):
+            oi = _f(t.get("openInterest")) / 2
+            extra["derived"] = "openInterest/2"
+        else:
+            oi = float(single)
+        return {
+            "exchange": EXCHANGE,
+            "symbol": t["symbol"],
+            "event_time": ch_ts(ts),
+            "ingest_time": ch_ts(recv_ms),
+            "open_interest": oi,
+            "extra": json.dumps(extra, separators=(",", ":")),
+        }
 
     async def _validate_focus(self) -> None:
         status: dict[str, str] = {}
