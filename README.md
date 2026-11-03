@@ -111,3 +111,7 @@ ssh scali sudo systemctl enable --now market-ingest@binance_um
 ```bash
 python3 tests/test_health.py
 ```
+
+Интеграционный тест с временным ClickHouse проверяет создание базы и обновление
+старой схемы с сохранением данных. Локальный запуск, проверка PR из форка и
+GitHub Actions описаны в [tests/README.md](tests/README.md).
