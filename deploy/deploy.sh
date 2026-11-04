@@ -3,6 +3,7 @@
 #
 #   ./deploy/deploy.sh              # rsync working tree (fast iteration)
 #   ./deploy/deploy.sh --git        # server pulls from origin instead
+#   ./deploy/deploy.sh --git --defer-migration-finish
 #
 # Reads VPS_ALIAS from the environment or defaults to the ssh Host name below.
 set -Eeuo pipefail
@@ -13,7 +14,16 @@ ETC=/etc/market-ingest
 REPO_URL="${REPO_URL:-git@github.com:greyfenrir/market-ingest.git}"
 BRANCH="${BRANCH:-main}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODE="${1:-rsync}"
+MODE=rsync
+DEFER_MIGRATION_FINISH=0
+for arg in "$@"; do
+  case "$arg" in
+    --git) MODE=--git ;;
+    rsync) MODE=rsync ;;
+    --defer-migration-finish) DEFER_MIGRATION_FINISH=1 ;;
+    *) printf 'Unknown argument: %s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
 
 say() { printf '\033[36m[ .. ]\033[0m %s\n' "$*"; }
 ok()  { printf '\033[32m[ ok ]\033[0m %s\n' "$*"; }
@@ -55,7 +65,7 @@ else
     --exclude '.git' --exclude '__pycache__' --exclude '.venv' \
     --exclude '*.pyc' --exclude 'logs' \
     --rsync-path="sudo -u ingest rsync" \
-    "$HERE"/{src,schema,deploy,requirements.txt} "$HOST:$DEST/"
+    "$HERE"/{src,schema,deploy,requirements.txt,config.example.toml} "$HOST:$DEST/"
 fi
 
 # Record which code is about to run. Rows the collector computes rather than
@@ -94,6 +104,9 @@ ssh "$HOST" "sudo -u ingest bash -c '
 say "schema (idempotent, from $DEST/schema)"
 ssh "$HOST" "set -e; for f in $DEST/schema/*.sql; do clickhouse-client --multiquery < \"\$f\"; done"
 
+say "preparing order-book migration"
+ssh "$HOST" "python3 $DEST/deploy/migrations/book_depth.py --phase prepare --client clickhouse-client"
+
 say "clickhouse ingest user"
 ssh "$HOST" "sudo bash $DEST/deploy/setup_ch_user.sh"
 
@@ -111,16 +124,33 @@ ssh "$HOST" "sudo install -m 0644 \
     /etc/systemd/system/ && sudo systemctl daemon-reload && \
     sudo systemctl enable --now market-ingest-storage-probe.timer"
 
-# One instance per exchange. Restart the enabled ones - all of them, since they
-# share this code - and leave the decision to enable a new exchange to a human.
-# An enabled instance of a template has its symlink in the wants directory.
-units="$(ssh "$HOST" "ls /etc/systemd/system/multi-user.target.wants/ 2>/dev/null | grep '^market-ingest@.*\.service$'" || true)"
+# Running disabled instances also need the new writer before removing old columns.
+units="$(ssh "$HOST" bash -s <<'REMOTE'
+set -Eeuo pipefail
+{
+  systemctl list-unit-files --type=service --state=enabled --no-legend --no-pager 'market-ingest@*.service'
+  systemctl list-units --type=service --state=active,activating --plain --no-legend --no-pager 'market-ingest@*.service'
+} | awk '$1 ~ /^market-ingest@[^[:space:]]+\.service$/ {print $1}' | sort -u
+REMOTE
+)"
 if [[ -n "$units" ]]; then
-  say "restarting collectors: $(echo $units)"
-  ssh "$HOST" "sudo systemctl restart $(echo $units)"
+  unit_list="$(printf '%s\n' "$units" | tr '\n' ' ')"
+  say "restarting collectors: $unit_list"
+  ssh "$HOST" "sudo systemctl restart $unit_list"
+  while IFS= read -r unit; do
+    ssh "$HOST" "sudo systemctl is-active --quiet $unit" < /dev/null
+  done <<< "$units"
 else
   say "no collector enabled yet; enable one per exchange with:"
   echo "    ssh $HOST sudo systemctl enable --now market-ingest@<exchange>"
+fi
+
+if [[ "$DEFER_MIGRATION_FINISH" == 1 ]]; then
+  say "migration finish deferred; run after checking the new collectors:"
+  printf 'ssh %s python3 %s/deploy/migrations/book_depth.py --phase finish --client clickhouse-client\n' "$HOST" "$DEST"
+else
+  say "finishing order-book migration"
+  ssh "$HOST" "python3 $DEST/deploy/migrations/book_depth.py --phase finish --client clickhouse-client"
 fi
 
 ok "deployed"

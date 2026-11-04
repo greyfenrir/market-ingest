@@ -1,4 +1,4 @@
-"""Example of a two-phase order-book migration for existing collectors."""
+"""Migrate order-book history before and after updating the collectors."""
 
 from __future__ import annotations
 

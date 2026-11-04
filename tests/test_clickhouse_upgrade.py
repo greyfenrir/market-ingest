@@ -40,7 +40,7 @@ def export_ref(repo: Path, ref: str, destination: Path) -> str:
     revision = f"{ref}^{{commit}}"
     sha = command(["git", "-C", str(repo), "rev-parse", "--verify", "--end-of-options",
                    revision]).strip()
-    archive = subprocess.check_output(["git", "-C", str(repo), "archive", sha, "schema", "src"])
+    archive = subprocess.check_output(["git", "-C", str(repo), "archive", sha, "schema", "src", "deploy"])
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         for member in tar:
             path = Path(member.name)
@@ -330,7 +330,7 @@ def main() -> int:
     parser.add_argument("--extra-sql", type=Path, action="append", default=[],
                         help="Apply a proposed migration after schema/*.sql (repeatable)")
     parser.add_argument("--migration-script", type=Path,
-                        help="Run a proposed Python migration with prepare and finish phases")
+                        help="Override deploy/migrations/book_depth.py for a migration experiment")
     parser.add_argument("--image", default=IMAGE, help="ClickHouse server image")
     parser.add_argument("--emit-rows", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -339,7 +339,6 @@ def main() -> int:
         print(json.dumps(collector_rows(source)))
         return 0
     extra = [path.resolve(strict=True) for path in args.extra_sql]
-    script = args.migration_script.resolve(strict=True) if args.migration_script else None
     with tempfile.TemporaryDirectory(prefix="market-ingest-upgrade-") as temp:
         root = Path(temp)
         baseline = root / "baseline"
@@ -351,6 +350,11 @@ def main() -> int:
             print(f"Target: {sha}", flush=True)
         else:
             print(f"Target working tree: {source}", flush=True)
+        script = source / "deploy" / "migrations" / "book_depth.py"
+        if args.migration_script:
+            script = args.migration_script.resolve(strict=True)
+        elif not script.is_file():
+            script = None
         old_rows = emit_rows(baseline, MARKER)
         rows = emit_rows(source, TARGET)
         print(f"Collector rows: {len(rows)} ({', '.join(sorted({r['exchange'] for r in rows}))})",
