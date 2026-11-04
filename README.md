@@ -17,7 +17,11 @@
 src/ingest/
   chsink.py              батчевая запись в ClickHouse с очередью и back-pressure
   health.py              поминутная статистика, детектор разрывов, события связи
+  rest.py                общий REST-клиент: бюджет веса, пауза после 429/418
+  book.py                локальный стакан и его посекундный агрегат
+  exchanges/base.py      общее для всех бирж: WS-цикл, здоровье, строки стакана
   exchanges/binance_um.py коннектор Binance USDⓈ-M
+  exchanges/bybit_linear.py коннектор Bybit linear (USDT/USDC перпетуалы и фьючерсы)
   __main__.py            точка входа: один процесс на биржу
 schema/                  DDL, идемпотентный
 deploy/                  systemd-юнит, деплой, создание пользователя ClickHouse
@@ -81,6 +85,29 @@ wss://fstream.binance.com/market/ws/btcusdt@aggTrade  работает
 (`stall_seconds` в конфиге): тишина дольше ожидаемой считается ошибкой и ведёт к
 переподключению, а не к спокойствию.
 
+## Особенности Bybit
+
+- Подписка сообщением, и Bybit нужен собственный JSON-ping раз в 20 с: без
+  него соединение рвётся, несмотря на пинги WebSocket.
+- С 26.11.2026 не больше 100 подписок на соединение; сборщик не стартует,
+  если основных символов или стаканов больше.
+- id сделки — UUID (`trade_id`), сквозной нумерации нет, поэтому потерю
+  сделок по id не доказать, как у Binance; `agg_id` хранит `seq` Bybit.
+- Стакан Bybit сам держит ровно 1000 уровней и удаляет выпавшие за них,
+  поэтому глубина доступна только до 1000-го уровня (у BTC около ±0.25 %).
+- Ликвидации — все, а не одна в секунду, как у Binance. `side` — сторона
+  ордера ликвидации, как у Binance; сторона позиции от Bybit лежит в `extra`.
+- Тикер присылает только изменившиеся поля и молчит, пока mark не меняется,
+  поэтому строку mark price основных символов раз в секунду пишет таймер из
+  накопленного состояния. Если последнее сообщение старше секунды, в `extra`
+  лежит его время (`{"ts": …}`); пока сокет лежит или символ молчит дольше
+  минуты, строк нет.
+- Open interest и mark price неосновных символов — один запрос
+  `/v5/market/tickers` в минуту.
+- `openInterest` у Bybit — сумма обеих сторон, ровно вдвое больше, чем OI
+  у Binance. В `open_interest` пишется односторонний `singleOpenInterest`;
+  собственные цифры Bybit лежат в `extra`.
+
 ## Контроль качества
 
 Критерий выхода P0 — `stale` < 1% и непрерывный архив без разрывов > 5 мин.
@@ -102,6 +129,24 @@ wss://fstream.binance.com/market/ws/btcusdt@aggTrade  работает
 ssh scali sudo systemctl enable --now market-ingest@binance_um
 ```
 
+`deploy.sh` по умолчанию деплоит на `scali` (другой хост — через `VPS_ALIAS`) и
+перезапускает все включённые экземпляры `market-ingest@*`. Новую биржу он сам
+не включает.
+
+### Новая биржа
+
+Имя биржи (например, `binance_um`) — это одновременно аргумент `--exchange`,
+секция конфига `[binance_um]`, экземпляр юнита `market-ingest@binance_um` и
+значение колонки `exchange`. Чтобы добавить биржу:
+
+1. коннектор в `src/ingest/exchanges/`, наследник `Collector` из `base.py`;
+2. строка в `EXCHANGES` в `src/ingest/__main__.py`;
+3. секция в `/etc/market-ingest/config.toml` (без неё процесс не стартует);
+4. `systemctl enable --now market-ingest@<имя>`.
+
+Графики и алармы Netdata от имени биржи не зависят: алармы заводятся на каждую
+биржу сами (`foreach`), как только приходят её метрики.
+
 Конфиг — `/etc/market-ingest/config.toml`, пароль ClickHouse — в
 `/etc/market-ingest/env` (создаётся `deploy/setup_ch_user.sh`, пользователь
 `ingest` имеет только INSERT/SELECT на `market` и `ops`).
@@ -111,3 +156,10 @@ ssh scali sudo systemctl enable --now market-ingest@binance_um
 ```bash
 python3 tests/test_health.py
 ```
+
+Интеграционный тест с временным ClickHouse проверяет создание базы и обновление
+старой схемы с сохранением данных. Локальный запуск, проверка PR из форка и
+GitHub Actions описаны в [tests/README.md](tests/README.md).
+
+Первое обновление, ручное завершение миграции и включение Bybit описаны в
+[deploy/README.md](deploy/README.md).

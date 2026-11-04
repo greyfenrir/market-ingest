@@ -17,10 +17,12 @@ the snapshot reached on each side:
     bids >= bid_floor  and  asks <= ask_ceil   are complete;
     anything further out                        is a partial sample.
 
-Every depth figure is reported twice - strictly inside the trusted range, and
-over everything accumulated - and a band is valid only when the trusted range
-covers it. Whether the accumulated figure is good enough to use is a question
-for the data (compare against Binance's bookDepth archive), not for this code.
+Depth is counted over every level the book holds, trusted or not, and the
+trusted reach is reported next to it as coverage. On 2026-10-30 that figure
+matched Binance's bookDepth archive (median ratio 1.000) at 0.2-2 % on BTC and
+ETH too, where the trusted range covers almost none of it: in a book kept live
+for a while, the levels nobody has touched are few and small. Right after a
+start or a resync the book has not learned them yet - hence book_age_s.
 """
 
 from __future__ import annotations
@@ -83,6 +85,32 @@ class LocalBook:
         _apply_side(self.bids, bids)
         _apply_side(self.asks, asks)
         self.last_update_id = update_id
+
+    def absorb(self, older: "LocalBook") -> None:
+        """Take over what an older book of the same symbol knows and this one
+        does not. Used when a refresh swaps a fresh book in: without it every
+        refresh would throw away the far levels the old book had learned.
+
+        Both books must stand on the same update id, i.e. both have applied
+        every event since this one's snapshot. Deltas report every change, so
+        any level a live book holds is exact; the books can only differ in
+        what they have not heard of. Hence:
+        - a price this book holds is never replaced: it is as fresh as it gets;
+        - inside this book's trusted range nothing is taken: a price missing
+          there is an empty level, not an unknown one;
+        - outside it, a price only the older book holds is taken over;
+        - each book is complete inside its own trusted range, so the merged
+          book is complete inside their union."""
+        if older.last_update_id != self.last_update_id:
+            raise ValueError("books are on different update ids")
+        for p, q in older.bids.items():
+            if p < self.bid_floor:
+                self.bids.setdefault(p, q)
+        for p, q in older.asks.items():
+            if p > self.ask_ceil:
+                self.asks.setdefault(p, q)
+        self.bid_floor = min(self.bid_floor, older.bid_floor)
+        self.ask_ceil = max(self.ask_ceil, older.ask_ceil)
 
     def invalidate(self) -> None:
         """Forget everything. Called on a sequence break, so that a stale
@@ -148,8 +176,8 @@ class LocalBook:
         bounds = [mid * p / 100 for p in bands]
         bid_trusted = mid - self.bid_floor
         ask_trusted = self.ask_ceil - mid
-        bid_strict, bid_acc = _depth(((mid - p, q) for p, q in bids), bounds, bid_trusted)
-        ask_strict, ask_acc = _depth(((p - mid, q) for p, q in asks), bounds, ask_trusted)
+        bid_depth = _depth(((mid - p, q) for p, q in bids), bounds)
+        ask_depth = _depth(((p - mid, q) for p, q in asks), bounds)
 
         row = {
             "best_bid": bb,
@@ -165,19 +193,15 @@ class LocalBook:
         }
         for i, p in enumerate(bands):
             b = band_label(p)
-            row[f"depth_bid_usd_{b}"] = bid_strict[i] * ref
-            row[f"depth_ask_usd_{b}"] = ask_strict[i] * ref
-            row[f"depth_bid_usd_acc_{b}"] = bid_acc[i] * ref
-            row[f"depth_ask_usd_acc_{b}"] = ask_acc[i] * ref
-            # Compared on distances rather than on the rounded percentages, so
-            # a band edge that the trusted range exactly reaches counts.
-            row[f"band_valid_bid_{b}"] = int(bid_trusted >= bounds[i])
-            row[f"band_valid_ask_{b}"] = int(ask_trusted >= bounds[i])
+            # Whole dollars: cents of depth carry no information, and integers
+            # compress about three times better than floats here.
+            row[f"depth_bid_usd_{b}"] = round(bid_depth[i] * ref)
+            row[f"depth_ask_usd_{b}"] = round(ask_depth[i] * ref)
         return row
 
 
 def empty_aggregate(bands: Iterable[float] = BANDS_PCT) -> dict:
-    """The same keys as LocalBook.aggregate, all zero and every band invalid.
+    """The same keys as LocalBook.aggregate, all zero.
     Written while a book is resyncing, so a second without a valid book is a
     row that says so rather than a hole that says nothing."""
     row: dict = {k: 0.0 for k in ("best_bid", "best_ask", "best_bid_qty", "best_ask_qty",
@@ -186,9 +210,7 @@ def empty_aggregate(bands: Iterable[float] = BANDS_PCT) -> dict:
     for p in sorted(bands):
         b = band_label(p)
         for side in ("bid", "ask"):
-            row[f"depth_{side}_usd_{b}"] = 0.0
-            row[f"depth_{side}_usd_acc_{b}"] = 0.0
-            row[f"band_valid_{side}_{b}"] = 0
+            row[f"depth_{side}_usd_{b}"] = 0
     return row
 
 
@@ -201,27 +223,24 @@ def _apply_side(side: dict[float, float], levels: Levels) -> None:
             side[p] = q
 
 
-def _depth(levels, bounds: list[float], trusted: float) -> tuple[list[float], list[float]]:
+def _depth(levels, bounds: list[float]) -> list[float]:
     """Cumulative qty within each distance bound, in one pass from the best
-    level outward. Returns (strict, accumulated): strict counts only levels
-    inside the trusted distance."""
+    level outward."""
     n = len(bounds)
-    strict, acc = [0.0] * n, [0.0] * n
-    s = a = 0.0
+    out = [0.0] * n
+    total = 0.0
     i = 0
     for dist, qty in levels:
         while i < n and dist > bounds[i]:
-            strict[i], acc[i] = s, a
+            out[i] = total
             i += 1
         if i == n:
             break
-        a += qty
-        if dist <= trusted:
-            s += qty
+        total += qty
     while i < n:
-        strict[i], acc[i] = s, a
+        out[i] = total
         i += 1
-    return strict, acc
+    return out
 
 
 def _pct(distance: float, mid: float) -> float:

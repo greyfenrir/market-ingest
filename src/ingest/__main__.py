@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import logging
 import os
 import signal
@@ -22,10 +23,30 @@ except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
 from .chsink import ClickHouseSink
-from .exchanges.binance_um import BinanceUM
 from .metrics import Statsd
 
-EXCHANGES = {"binance_um": BinanceUM}
+# --exchange name -> "module:Class". Each name is also the config section, the
+# systemd instance (market-ingest@<name>) and the `exchange` column. Imported
+# on demand, so a broken connector cannot stop the others from starting.
+EXCHANGES = {
+    "binance_um": "ingest.exchanges.binance_um:BinanceUM",
+    "bybit_linear": "ingest.exchanges.bybit_linear:BybitLinear",
+}
+
+
+def collector_class(name: str):
+    module, cls = EXCHANGES[name].split(":")
+    return getattr(importlib.import_module(module), cls)
+
+
+def exchange_config(cfg: dict, name: str) -> dict:
+    """The exchange's own section. Missing is an error, not an empty
+    section: an instance enabled for an exchange nobody configured would
+    otherwise start with no focus symbols and look healthy."""
+    section = cfg.get(name)
+    if not isinstance(section, dict):
+        raise KeyError(f"no [{name}] section in the config")
+    return section
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,6 +61,11 @@ async def amain(args) -> int:
     cfg = tomllib.loads(args.config.read_text())
     ch = cfg.get("clickhouse", {})
     ing = cfg.get("ingest", {})
+    try:
+        ex_cfg = exchange_config(cfg, args.exchange)
+    except KeyError as exc:
+        logging.error("%s", exc.args[0])
+        return 2
 
     logging.info("%s collector, version %s", args.exchange,
                  os.environ.get("COLLECTOR_VERSION") or "unset")
@@ -75,14 +101,13 @@ async def amain(args) -> int:
     )
     await sd.start()
 
-    ex_cfg = cfg.get(args.exchange, {})
     if not ex_cfg.get("enabled", True):
         logging.warning("%s is disabled in config, nothing to do", args.exchange)
         await sd.stop()
         await sink.stop()
         return 0
 
-    collector = EXCHANGES[args.exchange](
+    collector = collector_class(args.exchange)(
         ex_cfg, sink, focus=ex_cfg.get("focus_symbols", []), sd=sd
     )
 

@@ -1,4 +1,7 @@
 # Copy to /etc/market-ingest/config.toml on the server.
+# One section per exchange, named as the --exchange argument and the systemd
+# instance (market-ingest@binance_um reads [binance_um]); a collector refuses to
+# start without its section.
 # Secrets do NOT live here - see /etc/market-ingest/env.
 
 [clickhouse]
@@ -46,6 +49,11 @@ focus_symbols = [
 open_interest_poll_seconds = 60
 open_interest_symbols      = "focus"   # "focus" or "all"
 
+# REST request weight this collector may spend per minute: snapshots, the OI
+# poll, exchangeInfo. Binance allows 2400 per IP and counts everything sent
+# from it; the collector follows Binance's own count when it is higher.
+rest_weight_per_minute = 1200
+
 # Binance drops WebSocket connections after 24h. Beat it to the punch.
 # (Must stay above the first [binance_um.*] header: TOML would otherwise file
 # it under that table, where nothing reads it.)
@@ -67,7 +75,8 @@ enabled                = true
 symbols                = "focus"   # "focus" or a list of symbols
 update_speed_ms        = 100       # 100 or 500
 # 1000 levels weigh 20 against the REST limit and reach only ~+-0.16 % on BTC;
-# bands beyond that are reported but flagged invalid.
+# beyond that the book knows the levels deltas have shown it, which matched
+# Binance's own depth archive once the book had run for a while (book_age_s).
 snapshot_limit         = 1000
 max_parallel_snapshots = 2
 # Levels further than this from mid are dropped: deltas add far levels and
@@ -81,3 +90,44 @@ stale_seconds          = 5
 # once per refresh_min_seconds per symbol (20 weight each).
 refresh_ratio          = 0.5
 refresh_min_seconds    = 60
+
+[bybit_linear]
+enabled = true
+
+# Bybit takes at most 100 topics per connection; the collector refuses to
+# start with more focus or depth symbols than that.
+focus_symbols = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
+    "DOGEUSDT", "ADAUSDT", "LINKUSDT", "AVAXUSDT", "SUIUSDT",
+    "LTCUSDT", "TRXUSDT", "DOTUSDT", "NEARUSDT", "APTUSDT",
+    "ARBUSDT", "OPUSDT", "HYPEUSDT", "FILUSDT", "INJUSDT",
+]
+
+# One GET /v5/market/tickers per period: open interest for these symbols, and
+# the sampled mark price of every non-focus symbol.
+open_interest_poll_seconds = 60
+open_interest_symbols      = "focus"   # "focus" or "all"
+
+# Bybit allows 600 requests per 5 s per IP and answers a breach with a 403
+# and a ban of at least 10 minutes.
+rest_requests_per_5s = 300
+
+reconnect_after_hours = 23
+
+[bybit_linear.stall_seconds]
+mark_price   = 30
+agg_trade    = 900
+force_order  = 7200
+depth        = 30
+
+# Order book: snapshot and deltas both come on the socket. Bybit itself keeps
+# the book to its top `levels`, so the book reaches as far as its last level
+# and no further (~+-0.25 % on BTC at 1000 levels) - unlike Binance, depth
+# beyond that cannot be learned from deltas.
+[bybit_linear.depth]
+enabled                   = true
+symbols                   = "focus"   # "focus" or a list of symbols
+levels                    = 1000      # 1, 50, 200 or 1000
+stale_seconds             = 5
+# A book left without a snapshot this long is subscribed again.
+resubscribe_after_seconds = 10

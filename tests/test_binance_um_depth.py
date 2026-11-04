@@ -7,6 +7,7 @@ try:
 except ModuleNotFoundError:  # only imported at module level, never used here
     sys.modules["websockets"] = types.ModuleType("websockets")
 
+import ingest.exchanges.binance_um as bu_um
 from ingest.exchanges.binance_um import BinanceUM
 from ingest.exchanges.binance_um_depth import ALIGNING, LIVE, SYNCING, DepthSync
 
@@ -138,8 +139,8 @@ class FakeSink:
     def of(self, table): return [r for t, r in self.rows if t == table]
 
 class FakeStatsd:
-    def __init__(self): self.gauges = {}
-    def incr(self, *a, **k): pass
+    def __init__(self): self.gauges, self.counters = {}, {}
+    def incr(self, name, value=1): self.counters[name] = self.counters.get(name, 0) + value
     def gauge(self, name, value): self.gauges[name] = value
 
 def make(depth=None):
@@ -165,7 +166,7 @@ c, sink = make()
 c._emit_book_rows(SEC, time.monotonic())
 row = sink.of("market.book_agg")[-1]
 check("no snapshot yet: state resync", row["state"], "resync")
-check("zeros, not missing", (row["best_bid"], row["depth_bid_usd_1"], row["band_valid_bid_0p2"]), (0.0, 0.0, 0))
+check("zeros, not missing", (row["best_bid"], row["depth_bid_usd_1"], row["book_age_s"]), (0.0, 0, 0))
 check("event_time is the second", row["event_time"], "2026-09-10 08:45:00")
 
 sync = c.depth["BTCUSDT"]
@@ -181,6 +182,9 @@ c._emit_book_rows(SEC + 2, time.monotonic())
 check("depth priced at mark", sink.of("market.book_agg")[-1]["depth_bid_usd_1"], 4 * 200.0)
 c._emit_book_rows(SEC + 3, time.monotonic() + 60)
 check("no delta for too long: stale", sink.of("market.book_agg")[-1]["state"], "stale")
+check("rows counted per stream and for the exchange",
+      (c.sd.counters["rows.binance_um.book_agg"], c.sd.counters["rows_total.binance_um"]), (4, 4))
+check("book age counts from going live", 59 <= sink.of("market.book_agg")[-1]["book_age_s"] <= 61, True)
 
 print("== connector: resyncs are logged and visible in the rows")
 feed(c, ev(110, 112, 109))
@@ -244,11 +248,11 @@ def fetch(c, rest):
     async def go():
         real = asyncio.sleep
         def skip(*_):                           # skip backoff and Retry-After waits
-            c._rest_pause_until = 0.0
+            c.rest.pause_until = 0.0
             return real(0)
         asyncio.sleep = skip
         try:
-            c._rest, c._snap_sem = rest, asyncio.Semaphore(1)
+            c.rest._session, c._snap_sem = rest, asyncio.Semaphore(1)
             c._depth_open = True
             await c._fetch_snapshot(c.depth["BTCUSDT"])
         finally:
@@ -261,21 +265,12 @@ fetch(c, Rest(Resp(429, headers={"Retry-After": "7"}), Resp(200, SNAP)))
 check("429 logged with its wait", events(sink)[0], ("rate_limit", "BTCUSDT HTTP 429, retry after 7s"))
 check("then synced", (events(sink)[-1][0], c.depth["BTCUSDT"].live), ("synced", True))
 
-print("== connector: a 429 pauses every REST caller, not just the one that got it")
+print("== connector: snapshots draw on the collector's REST budget")
 c, sink = make()
-t = time.monotonic()
-c._rest_pause("depth", "BTCUSDT", 429, {"Retry-After": "7"})
-check("pause is shared and lasts Retry-After", round(c._rest_pause_until - t), 7)
-c._rest_pause("open_interest", "ETHUSDT", 418, {"Retry-After": "2"})
-check("a shorter pause does not cut a longer one", round(c._rest_pause_until - t), 7)
-c._rest_pause("depth", "BTCUSDT", 429, {"Retry-After": "soon"})
-check("unreadable Retry-After waits 60 s", round(c._rest_pause_until - t), 60)
-c._rest_pause_until = time.monotonic() + 0.2
-async def timed_wait():
-    t0 = time.monotonic(); await c._rest_wait(); return time.monotonic() - t0
-check("callers wait out the pause", asyncio.run(timed_wait()) >= 0.19, True)
-c._rest_pause_until = 0.0
-check("no pause, no wait", asyncio.run(timed_wait()) < 0.05, True)
+c.depth["BTCUSDT"].on_event(ev(99, 103, 98))
+fetch(c, Rest(Resp(200, SNAP, headers={"X-MBX-USED-WEIGHT-1M": "300"})))
+check("a 1000-level snapshot costs 20, Binance's count wins", (c.rest._local, c.rest.used()), (20, 300))
+check("weights by limit", [bu_um.depth_weight(n) for n in (5, 50, 100, 500, 1000)], [2, 2, 5, 10, 20])
 
 c, sink = make()
 sync = c.depth["BTCUSDT"]
@@ -317,7 +312,7 @@ c, sink = make()
 c.depth["BTCUSDT"].on_event(ev(99, 103, 98))
 rest = Rest(Resp(200, SNAP))
 async def fetch_closed():
-    c._rest, c._snap_sem = rest, asyncio.Semaphore(1)
+    c.rest._session, c._snap_sem = rest, asyncio.Semaphore(1)
     await c._fetch_snapshot(c.depth["BTCUSDT"])  # _depth_open is False
 asyncio.run(fetch_closed())
 check("a fetch gives up while the stream is closed", (rest.calls, c.depth["BTCUSDT"].live), (0, False))
@@ -334,7 +329,7 @@ c, sink = make({"snapshot_limit": 3, "refresh_min_seconds": 60})
 sync = c.depth["BTCUSDT"]
 c._depth_open = True
 sync.on_snapshot(SNAP); feed(c, ev(100, 104, 99))
-M0 = 1000.0
+M0 = time.monotonic()
 c._emit_book_rows(SEC, M0)
 check("first aggregate records the reach", sync.cover0, (1.0, 1.0))
 # the market lifts: asks up to 100.4 are taken, a bid appears at 100.6
@@ -356,11 +351,13 @@ c._emit_book_rows(SEC + 1, M0 + 1)
 feed(c, ev(106, 106, 105))
 FRESH2 = {"lastUpdateId": 106, "bids": [["100.6", "1"], ["100.0", "1"], ["99.5", "1"]],
           "asks": [["100.7", "1"], ["101.0", "1"], ["102.5", "1"]]}
+born = sync.live_since_mono
 async def fetch_shadow():
     real = asyncio.sleep
     asyncio.sleep = lambda *_: real(0)
     try:
-        c._rest, c._snap_sem, c._depth_open = Rest(Resp(200, FRESH2)), asyncio.Semaphore(1), True
+        c.rest._session, c._depth_open = Rest(Resp(200, FRESH2)), True
+        c._snap_sem = asyncio.Semaphore(1)
         await c._fetch_snapshot(sync.shadow, sync)
     finally:
         asyncio.sleep = real
@@ -368,6 +365,8 @@ asyncio.run(fetch_shadow())
 check("swapped in, logged as refresh done", events(sink)[-1], ("refresh", "BTCUSDT done: u=106"))
 check("no resync anywhere", [e for e, _ in events(sink) if e == "resync"], [])
 check("reach renewed", (sync.shadow, sync.book.ask_ceil), (None, 102.5))
+check("a refresh does not make the book younger", sync.live_since_mono, born)
+check("and the old book's bid reach kept", (sync.book.bid_floor, 99.0 in sync.book.bids), (99.0, True))
 c._emit_book_rows(SEC + 2, M0 + 2)
 row = sink.of("market.book_agg")[-1]
 check("next row ok, ask coverage back", (row["state"], round(row["covered_ask_pct"], 2)), ("ok", 1.84))
@@ -393,7 +392,7 @@ c2._emit_book_rows(SEC, time.monotonic())
 check("no books, no gauge", "book_not_ok_pct.binance_um" in c2.sd.gauges, False)
 
 print("== ws loop: on_open and on_close bracket every attempt")
-import ingest.exchanges.binance_um as bu
+import ingest.exchanges.base as bu   # the WS loop lives in the base class
 class WS:
     async def recv(self): raise RuntimeError("dropped")
 class Conn:

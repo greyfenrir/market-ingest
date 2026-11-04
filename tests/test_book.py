@@ -66,29 +66,25 @@ close("mark price sets the notional", book(limit=5).aggregate(mark=200)["depth_b
 close("contract size multiplies",
       book(limit=5).aggregate(mark=200, contract_size=0.01)["depth_bid_usd_2"], 8.0)
 close("custom bands", book(limit=5).aggregate(bands=[3])["depth_ask_usd_3"], 500.0)
+check("depth in whole dollars", book(limit=5).aggregate(mark=100.4)["depth_bid_usd_0p2"], 100)
+check("as integers", type(row["depth_bid_usd_2"]), int)
 
 print("== trusted range: a cut-off snapshot is not the whole book")
 # The snapshot reached exactly `limit` levels, so it was truncated at the last one.
 b = book(bids=BIDS[:3], asks=ASKS[:3], limit=3)
 row = b.aggregate()
 close("covered bid = distance to the furthest snapshot level", row["covered_bid_pct"], 1.0)
-check("bands inside coverage are valid",
-      [row[f"band_valid_bid_{x}"] for x in ("0p2", "0p5", "1", "2")], [1, 1, 1, 0])
-# A delta reveals a level beyond the snapshot. It is real, but its neighbours
-# may be missing, so it counts only toward the accumulated figure.
+# A delta reveals a level beyond the snapshot. It counts toward depth, but its
+# neighbours may still be unknown, so coverage stays where the snapshot left it.
 b.apply([["98.5", "4"]], [], 11)
 row = b.aggregate()
-close("strict 2 % ignores levels beyond the snapshot", row["depth_bid_usd_2"], 300.0)
-close("accumulated 2 % includes them",                 row["depth_bid_usd_acc_2"], 700.0)
-close("inside coverage strict == accumulated",
-      row["depth_bid_usd_1"], row["depth_bid_usd_acc_1"])
-check("revealed level does not widen coverage", row["band_valid_bid_2"], 0)
+close("depth counts levels beyond the snapshot", row["depth_bid_usd_2"], 700.0)
+close("and those inside it unchanged",           row["depth_bid_usd_1"], 300.0)
+close("revealed level does not widen coverage",  row["covered_bid_pct"], 1.0)
 
 print("== a side shorter than the limit is the whole side")
 row = book(limit=1000).aggregate()
 check("complete side reads as 100 %", (row["covered_bid_pct"], row["covered_ask_pct"]), (100.0, 100.0))
-check("every band valid", all(row[f"band_valid_{s}_{x}"] for s in ("bid", "ask")
-                              for x in ("0p2", "0p5", "1", "2")), True)
 row = book(limit=None).aggregate()
 close("unknown limit: assume truncated", row["covered_bid_pct"], 3.0)
 
@@ -98,8 +94,7 @@ b.apply([["99.9", "0"], ["99.6", "0"], ["99.0", "0"], ["98.0", "1"]],
         [["98.2", "1"]], 11)                          # market fell through the floor
 row = b.aggregate()
 check("no coverage below the floor", row["covered_bid_pct"], 0.0)
-check("all bid bands invalid", [row[f"band_valid_bid_{x}"] for x in ("0p2", "0p5", "1", "2")], [0, 0, 0, 0])
-close("nothing trusted on the bid side", row["depth_bid_usd_2"], 0.0)
+check("depth still counts what the book holds", row["depth_bid_usd_2"], round(1 * 98.1))
 
 print("== books that must not be aggregated")
 check("no snapshot yet",  LocalBook().aggregate(), None)
@@ -131,6 +126,24 @@ print("== empty_aggregate: same shape as a real row, all zero")
 real, empty = book(limit=5).aggregate(), empty_aggregate()
 check("same keys", set(real) ^ set(empty), set())
 check("all zero", {v for v in empty.values()}, {0})
+
+print("== absorb: a refreshed book keeps what the old one knew")
+old = book(uid=10)                                      # trusted 97.0 .. 103.0
+old.apply([["95.0", "2"], ["94.0", "1"], ["99.7", "5"]], [["104.0", "3"]], 11)
+fresh = book(bids=[["99.9", "1"], ["99.6", "1"]], asks=ASKS + [["103.5", "1"]], uid=10)
+fresh.apply([["95.0", "9"]], [], 11)                    # trusted 99.6 .. 103.5
+fresh.absorb(old)
+check("old book's trusted levels taken", [p in fresh.bids for p in (99.0, 98.5, 97.0)], [True] * 3)
+check("far levels it learned taken", (fresh.bids.get(94.0), fresh.asks.get(104.0)), (1.0, 3.0))
+check("a level the fresh book knows is kept", fresh.bids[95.0], 9.0)
+check("nothing taken inside the fresh trusted range", 99.7 in fresh.bids, False)
+check("trusted range is the union", (fresh.bid_floor, fresh.ask_ceil), (97.0, 103.5))
+close("coverage reflects it", fresh.aggregate()["covered_bid_pct"], 3.0)
+try:
+    book(uid=10).absorb(book(uid=11)); got = None
+except ValueError:
+    got = "refused"
+check("books on different update ids are refused", got, "refused")
 
 print("== determinism: same levels, same row, whatever the arrival order")
 a = book(limit=5)
