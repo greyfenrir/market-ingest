@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DeployTest(unittest.TestCase):
-    def deploy(self, *args, fail=""):
+    def deploy(self, *args, fail="", enabled=True):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             log = root / "commands.jsonl"
@@ -31,7 +31,14 @@ class DeployTest(unittest.TestCase):
                     raise SystemExit(42)
                 if program == "systemctl":
                     if "list-unit-files" in sys.argv:
-                        print("market-ingest@binance_um.service enabled enabled")
+                        enabled = os.environ["DEPLOY_TEST_ENABLED"] == "1"
+                        if "--state=enabled" in sys.argv and not enabled:
+                            raise SystemExit(1)
+                        if "--state=enabled" not in sys.argv:
+                            print("market-ingest@.service indirect enabled")
+                            print("market-ingest@unused.service disabled enabled")
+                        if enabled:
+                            print("market-ingest@binance_um.service enabled enabled")
                     elif "list-units" in sys.argv:
                         print("market-ingest@bybit_linear.service loaded active running collector")
                 elif program == "ssh":
@@ -45,6 +52,7 @@ class DeployTest(unittest.TestCase):
                 (root / name).symlink_to(stub)
             env = {**os.environ, "PATH": f"{root}:{os.environ['PATH']}",
                    "DEPLOY_TEST_LOG": str(log), "DEPLOY_TEST_FAIL": fail,
+                   "DEPLOY_TEST_ENABLED": str(int(enabled)),
                    "VPS_ALIAS": "deployment-test-host"}
             result = subprocess.run(["bash", "deploy/deploy.sh", *args], cwd=ROOT, env=env,
                                     stdin=subprocess.DEVNULL, text=True, capture_output=True,
@@ -71,6 +79,8 @@ class DeployTest(unittest.TestCase):
             self.assertLess(ready, finish)
         self.assertIn("market-ingest@binance_um.service", commands[restart]["command"])
         self.assertIn("market-ingest@bybit_linear.service", commands[restart]["command"])
+        self.assertNotIn("market-ingest@.service", commands[restart]["command"])
+        self.assertNotIn("market-ingest@unused.service", commands[restart]["command"])
 
     def test_finish_can_be_deferred(self):
         result, commands = self.deploy("--git", "--defer-migration-finish")
@@ -79,6 +89,17 @@ class DeployTest(unittest.TestCase):
         self.stage(commands, "systemctl restart")
         self.assertFalse(any("--phase finish" in entry["command"] for entry in commands))
         self.assertIn("--phase finish --client clickhouse-client", result.stdout)
+
+    def test_running_collector_restarts_without_enabled_instances(self):
+        result, commands = self.deploy("--git", "--defer-migration-finish", enabled=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        restart = self.stage(commands, "systemctl restart")
+        self.assertIn("market-ingest@bybit_linear.service", commands[restart]["command"])
+        self.assertNotIn("market-ingest@binance_um.service", commands[restart]["command"])
+        self.assertNotIn("market-ingest@.service", commands[restart]["command"])
+        self.assertNotIn("market-ingest@unused.service", commands[restart]["command"])
+        self.stage(commands, "systemctl is-active --quiet market-ingest@bybit_linear.service")
+        self.assertFalse(any("--phase finish" in entry["command"] for entry in commands))
 
     def test_failed_preparation_prevents_restart(self):
         result, commands = self.deploy("--git", fail="--phase prepare")

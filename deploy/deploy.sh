@@ -128,7 +128,8 @@ ssh "$HOST" "sudo install -m 0644 \
 units="$(ssh "$HOST" bash -s <<'REMOTE'
 set -Eeuo pipefail
 {
-  systemctl list-unit-files --type=service --state=enabled --no-legend --no-pager 'market-ingest@*.service'
+  systemctl list-unit-files --type=service --no-legend --no-pager 'market-ingest@*.service' |
+    awk '$2 == "enabled" {print $1}'
   systemctl list-units --type=service --state=active,activating --plain --no-legend --no-pager 'market-ingest@*.service'
 } | awk '$1 ~ /^market-ingest@[^[:space:]]+\.service$/ {print $1}' | sort -u
 REMOTE
