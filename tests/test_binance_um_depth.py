@@ -329,7 +329,7 @@ c, sink = make({"snapshot_limit": 3, "refresh_min_seconds": 60})
 sync = c.depth["BTCUSDT"]
 c._depth_open = True
 sync.on_snapshot(SNAP); feed(c, ev(100, 104, 99))
-M0 = 1000.0
+M0 = time.monotonic()
 c._emit_book_rows(SEC, M0)
 check("first aggregate records the reach", sync.cover0, (1.0, 1.0))
 # the market lifts: asks up to 100.4 are taken, a bid appears at 100.6
