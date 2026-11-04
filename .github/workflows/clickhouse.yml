@@ -1,0 +1,26 @@
+name: ClickHouse schema upgrade
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  schema-upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: '3.10'
+      - name: Install collector dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Test fresh schema and upgrade
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha }}
+        run: python tests/test_clickhouse_upgrade.py --base-ref "$BASE_REF"
