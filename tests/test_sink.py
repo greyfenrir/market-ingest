@@ -66,8 +66,8 @@ def accepted(session):
             for line in body.split("\n")]
 
 
-def sink_with(rows, statuses=(), batch=100):
-    s = make(batch_max_rows=batch)
+def sink_with(rows, statuses=(), batch=100, **kw):
+    s = make(batch_max_rows=batch, **kw)
     s._session = FakeSession(statuses)
     for r in rows:
         s.write("t", r)
@@ -120,11 +120,53 @@ check("one error per rejected batch", s.insert_errors, 1)
 # 1 full + 2 per level for log2(8) = 3 levels
 check("cheap: 2*log2(n)+1 inserts", len(s._session.bodies), 7)
 
-print("== 400 on every row: dropped after one split, not one request per row")
+print("== two bad rows in different halves: every good row still lands")
+rows = [{"i": i} for i in range(8)]
+rows[0]["bad"] = rows[7]["bad"] = True
+s = sink_with(rows)
+run(s._flush("t", s._queues["t"]))
+check("good rows all inserted",    sorted(accepted(s._session)), [1, 2, 3, 4, 5, 6])
+check("only the two bad dropped",  (s.rejected_rows, s.dropped_rows, s.unsalvaged_rows), (2, 2, 0))
+
+print("== scattered bad rows in a big batch, within the limit")
+import random
+random.seed(7)
+for k in (2, 3, 5):
+    rows = [{"i": i} for i in range(20000)]
+    bad = set(random.sample(range(20000), k))
+    for b in bad:
+        rows[b]["bad"] = True
+    s = sink_with(rows, batch=20000)
+    run(s._flush("t", s._queues["t"]))
+    got = accepted(s._session)
+    check(f"k={k}: every good row in, once",
+          (len(got), set(got) == set(range(20000)) - bad), (20000 - k, True))
+    check(f"k={k}: only the bad dropped, within the limit",
+          (s.rejected_rows, s.unsalvaged_rows, len(s._session.bodies) <= 1 + 128), (k, 0, True))
+
+print("== 400 on every row: the search stops at the limit")
 s = sink_with([{"i": i, "bad": True} for i in range(1000)], batch=1000)
 run(s._flush("t", s._queues["t"]))
-check("all dropped",  (s.rejected_rows, s.dropped_rows, s.inserted_rows), (1000, 1000, 0))
-check("3 inserts",    len(s._session.bodies), 3)
+check("all dropped",       (s.rejected_rows, s.dropped_rows, s.inserted_rows), (1000, 1000, 0))
+check("1 + 128 inserts",   len(s._session.bodies), 129)
+check("counted as unsalvaged: unsearched, not proven bad", s.unsalvaged_rows, 1000)
+
+print("== limit reached with good rows still unsearched")
+rows = [{"i": i} for i in range(16)]
+rows[0]["bad"] = rows[15]["bad"] = True
+s = sink_with(rows, salvage_max_inserts=4)
+run(s._flush("t", s._queues["t"]))
+# full refused; [0..7] and [8..15] refused; [0..3] refused, [4..7] in; then
+# splitting [8..15] would need inserts 5 and 6
+check("inserted what the limit reached", sorted(accepted(s._session)), [4, 5, 6, 7])
+check("the rest dropped, in order, as unsalvaged",
+      (s.dropped_rows, s.rejected_rows, s.unsalvaged_rows), (12, 12, 12))
+check("1 + 4 inserts", len(s._session.bodies), 5)
+
+print("== limit 0: a refused batch is dropped whole")
+s = sink_with([{"i": 0}, {"i": 1, "bad": True}], salvage_max_inserts=0)
+run(s._flush("t", s._queues["t"]))
+check("dropped with one request", (s.dropped_rows, s.unsalvaged_rows, len(s._session.bodies)), (2, 2, 1))
 
 print("== 400 on a single-row batch")
 s = sink_with([{"i": 0, "bad": True}])
@@ -155,6 +197,18 @@ check("inserted half counted",        s.inserted_rows, 2)
 check("a retry finishes the job",     run(s._flush("t", s._queues["t"])), True)
 check("then the bad row is dropped, the good one in",
       (s.rejected_rows, s.inserted_rows, len(s._queues["t"])), (1, 3, 0))
+# several refused chunks pending when the database fails: bad 0 and 7 refuse
+# the batch, both halves and [0, 1]; [2, 3] goes in; [4, 5] hits a reset
+rows = [{"i": i} for i in range(8)]
+rows[0]["bad"] = rows[7]["bad"] = True
+s = sink_with(rows, statuses=[400, 400, 400, 400, 200, ConnectionResetError("reset")])
+settled = run(s._flush("t", s._queues["t"]))
+check("not settled",                          settled, False)
+check("every unsettled chunk back, in order", [r["i"] for r in s._queues["t"]], [0, 1, 4, 5, 6, 7])
+check("inserted chunk not sent again",        (s.inserted_rows, s.dropped_rows), (2, 0))
+check("a retry finishes the job",             run(s._flush("t", s._queues["t"])), True)
+check("then exactly the two bad are dropped",
+      (s.rejected_rows, s.inserted_rows, len(s._queues["t"])), (2, 6, 0))
 
 print("== shutdown drain gets past a rejected batch")
 rows = [{"i": i} for i in range(6)]

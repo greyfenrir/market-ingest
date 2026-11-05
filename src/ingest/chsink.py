@@ -17,8 +17,9 @@ Two properties matter more than throughput here:
 3. A failed insert is retried only if retrying can help. HTTP 400 means
    ClickHouse refused the data itself (a value it cannot parse, a wrong type,
    out of range): the same rows get the same answer forever, and retrying them
-   would block the table while its queue overflows. Such a batch is split to
-   save its good rows, and the rest is dropped and counted. Every other failure
+   would block the table while its queue overflows. Such a batch is split, up
+   to salvage_max_inserts inserts, to save its good rows; the bad rows, and
+   whatever the limit left unsearched, are dropped and counted. Every other failure
    - network, timeouts, overload, authentication (401/403), a table not created
    yet (404) - is fixed outside the data, so those rows wait and are retried.
 """
@@ -56,12 +57,16 @@ class ClickHouseSink:
         batch_max_rows: int = 5000,
         batch_max_seconds: float = 2.0,
         queue_max_rows: int = 400_000,
+        salvage_max_inserts: int = 128,
     ) -> None:
         self._url = url.rstrip("/")
         self._auth = aiohttp.BasicAuth(user, password)
         self._batch_max_rows = batch_max_rows
         self._batch_max_seconds = batch_max_seconds
         self._queue_max_rows = queue_max_rows
+        # Inserts spent isolating the bad rows of one refused batch; 0 drops
+        # a refused batch whole. Each insert that lands is a part to merge.
+        self._salvage_max_inserts = max(0, int(salvage_max_inserts))
 
         self._queues: dict[str, deque[dict[str, Any]]] = {}
         self._session: aiohttp.ClientSession | None = None
@@ -70,6 +75,7 @@ class ClickHouseSink:
 
         self.dropped_rows = 0     # lost for any reason: overflow or rejected
         self.rejected_rows = 0    # of those, refused by ClickHouse (HTTP 400)
+        self.unsalvaged_rows = 0  # of those, not searched for bad rows (limit hit)
         self.insert_errors = 0
         self.inserted_rows = 0
 
@@ -187,39 +193,59 @@ class ClickHouseSink:
         return error
 
     async def _salvage(self, table: str, rows: list, error: str) -> None:
-        """ClickHouse refuses a whole insert for one bad row. Halve the batch
-        and insert each half: a stray bad row costs about 2*log2(n) small
-        inserts, and every good row still lands. When both halves of a split
-        are refused, the defect is in the rows as a kind (a type that no
-        longer fits the table), not in one of them: the rest is dropped then,
-        rather than spending a request per row.
+        """ClickHouse refuses a whole insert for one bad row. Halve every
+        refused chunk and insert both halves, until each bad row is alone:
+        k bad rows cost about 2*k*log2(n/k) inserts, and every good row lands.
+        Bad rows in both halves of a split mean nothing about the others, so
+        every refused half is split again, not just one.
 
-        Raises _Retry with the rows still unsettled if the database fails for
-        another reason midway; rows already inserted are not sent again."""
-        chunk = rows
-        while len(chunk) > 1:
+        Chunks are taken level by level, largest first, so the good rows of
+        big halves land before the search goes deep. It stops after
+        salvage_max_inserts inserts: when every row is bad (a type that no
+        longer fits the table) a full search would cost ~2n requests. What is
+        left unsearched then is dropped, good rows with it, and counted in
+        unsalvaged_rows as well as rejected_rows.
+
+        Raises _Retry with the rows still unsettled, in their original order,
+        if the database fails for another reason midway; rows already inserted
+        are not sent again."""
+        pending = deque([(0, rows)])    # (offset in rows, refused chunk)
+        bad: list = []                  # rows refused on their own
+        inserts = 0
+        while pending:
+            at, chunk = pending.popleft()
+            if len(chunk) == 1:
+                bad.extend(chunk)
+                continue
+            if inserts + 2 > self._salvage_max_inserts:
+                pending.appendleft((at, chunk))
+                break
             mid = len(chunk) // 2
-            halves = [chunk[:mid], chunk[mid:]]
-            refused = []
-            for k, half in enumerate(halves):
+            halves = [(at, chunk[:mid]), (at + mid, chunk[mid:])]
+            for k, (off, half) in enumerate(halves):
                 try:
                     e = await self._insert(table, half)
                 except _Retry as exc:
-                    unsettled = [r for h in refused for r in h] + [r for h in halves[k:] for r in h]
-                    raise _Retry(exc.args[0], unsettled) from None
+                    if bad:
+                        self._drop_rejected(table, bad, error)
+                    left = sorted([*pending, *halves[k:]], key=lambda c: c[0])
+                    raise _Retry(exc.args[0], [r for _, c in left for r in c]) from None
+                inserts += 1
                 if e is not None:
-                    refused.append(half)
+                    pending.append((off, half))
                     error = e
-            if not refused:
-                return
-            if len(refused) == 2:
-                break
-            chunk = refused[0]
-        self._drop_rejected(table, chunk, error)
+        if bad:
+            self._drop_rejected(table, bad, error)
+        if pending:
+            left = [r for _, c in sorted(pending, key=lambda c: c[0]) for r in c]
+            self.unsalvaged_rows += len(left)
+            self._drop_rejected(table, left, error,
+                                f"of {table} left unsearched after {inserts} salvage inserts "
+                                f"(the limit), good ones among them")
 
-    def _drop_rejected(self, table: str, rows: list, error: str) -> None:
+    def _drop_rejected(self, table: str, rows: list, error: str, why: str = "") -> None:
         self.rejected_rows += len(rows)
         self.dropped_rows += len(rows)
         sample = json.dumps(rows[0], separators=(",", ":"), default=repr)[:400]
-        log.error("dropped %d rows rejected by %s: %s; first row: %s",
-                  len(rows), table, error, sample)
+        log.error("dropped %d rows %s: %s; first row: %s",
+                  len(rows), why or f"rejected by {table}", error, sample)

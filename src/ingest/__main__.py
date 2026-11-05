@@ -57,6 +57,7 @@ async def amain(args) -> int:
         batch_max_rows=ing.get("batch_max_rows", 5000),
         batch_max_seconds=ing.get("batch_max_seconds", 2.0),
         queue_max_rows=ing.get("queue_max_rows", 400_000),
+        salvage_max_inserts=ing.get("salvage_max_inserts", 128),
     )
     await sink.start()
     try:
@@ -97,8 +98,9 @@ async def amain(args) -> int:
     # to a routine restart.
     await sink.stop()
     await sd.stop()
-    logging.info("inserted=%d dropped=%d insert_errors=%d",
-                 sink.inserted_rows, sink.dropped_rows, sink.insert_errors)
+    logging.info("inserted=%d dropped=%d (rejected=%d, unsalvaged=%d) insert_errors=%d",
+                 sink.inserted_rows, sink.dropped_rows, sink.rejected_rows,
+                 sink.unsalvaged_rows, sink.insert_errors)
     return code
 
 

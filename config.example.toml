@@ -20,6 +20,12 @@ batch_max_seconds = 30.0
 # Rows kept in memory when ClickHouse is unreachable. Beyond this we drop the
 # oldest and count it - a collector that OOMs loses far more than a few rows.
 queue_max_rows    = 400000
+# ClickHouse refuses a whole insert for one bad row (HTTP 400). The batch is
+# then halved and re-sent until each bad row is alone, spending at most this
+# many inserts per batch. 128 saves every good row of a 20000-row batch with
+# up to ~5 bad rows, in 2-5 s; a batch with every row bad stops at the limit
+# and is dropped. 0 drops a refused batch whole.
+salvage_max_inserts = 128
 
 # Throughput and archive size are published to Netdata's built-in StatsD
 # receiver (UDP 127.0.0.1:8125), so collector metrics appear next to the host's
