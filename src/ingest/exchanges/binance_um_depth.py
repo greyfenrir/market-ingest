@@ -19,7 +19,8 @@ market walks away from it: on BTC +-0.16 % is gone within minutes, and from
 then on one side of the book has no trusted range at all. A refresh builds a
 second, shadow DepthSync from a fresh snapshot using the very same procedure,
 feeds it the same events as the live book, and swaps it in the moment both
-stand on the same update id. The live book never stops in between.
+stand on the same update id. The live book never stops in between, and what it
+knew beyond the fresh snapshot's reach is carried over, not thrown away.
 
 No I/O here. The connector decides when to fetch a snapshot; this class only
 says whether it needs one and what to do with it.
@@ -39,6 +40,9 @@ class DepthSync:
     # events at 100 ms. The cap only matters if the REST side is stuck; then
     # the oldest events are the ones a late snapshot would discard anyway.
     MAX_BUFFER = 5000
+    # Deltas add levels at any distance and nothing removes them: the
+    # collector has to prune.
+    bounded = False
 
     def __init__(self, symbol: str, depth_limit: int = 1000) -> None:
         self.symbol = symbol
@@ -54,13 +58,16 @@ class DepthSync:
         self.resyncs = 0
         self.last_event_ms = 0.0      # exchange transaction time of the last applied event
         self.last_applied_mono = 0.0  # local monotonic time of the last applied event
+        # When the book last went live from a snapshot. A refresh swap keeps
+        # it: the book keeps what it had learned, so it does not get younger.
+        self.live_since_mono = 0.0
         # Flags for the connector to log and clear: the book went live, or a
         # refresh was swapped in. Kept here so this class stays free of I/O.
         self.just_live = False
         self.just_refreshed = False
         # Refresh: the shadow being built, when the last one started, and the
         # coverage (bid %, ask %) measured on the book's first live aggregate,
-        # i.e. how far a fresh snapshot reached.
+        # i.e. how far it reached right after its snapshot or refresh.
         self.shadow: DepthSync | None = None
         self.last_refresh_mono = float("-inf")
         self.cover0: tuple[float, float] | None = None
@@ -142,10 +149,13 @@ class DepthSync:
     def try_swap(self) -> bool:
         """Swap the shadow in once it is live and on the same update id as the
         live book. Both apply the same events after alignment, so equal ids
-        mean equal books inside the old range - and a wider one outside it."""
+        mean equal books wherever both know a level. The fresh book keeps the
+        far levels and the trusted reach the old one had (LocalBook.absorb):
+        a refresh widens what is known, it never trades one side for the other."""
         sh = self.shadow
         if sh is None or not sh.live or sh.book.last_update_id != self.book.last_update_id:
             return False
+        sh.book.absorb(self.book)
         self.book = sh.book
         self.shadow = None
         self.cover0 = None      # measured again on the next aggregate
@@ -172,6 +182,7 @@ class DepthSync:
                 return self.reset(f"gap after snapshot: U={first_id} > lastUpdateId={book_id}")
             self.state = LIVE               # U <= lastUpdateId <= u
             self.just_live = True
+            self.live_since_mono = mono
         else:
             if last_id <= book_id:
                 return None                 # already applied (redelivery)

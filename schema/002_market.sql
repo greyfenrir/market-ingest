@@ -47,10 +47,15 @@ CREATE TABLE IF NOT EXISTS market.trades
     symbol         LowCardinality(String),
     event_time     DateTime64(3, 'UTC') CODEC(Delta(8), ZSTD(3)),
     ingest_time    DateTime64(3, 'UTC') CODEC(Delta(8), ZSTD(3)),
-    -- Aggregate-trade id is contiguous per symbol, so a jump in it is a
-    -- provable gap in our archive rather than a quiet hole. first_id/last_id
-    -- bound the individual trades folded into this aggregate.
+    -- Binance: the aggregate-trade id, contiguous per symbol, so a jump in it
+    -- is a provable gap in our archive rather than a quiet hole; first_id/
+    -- last_id bound the individual trades folded into the aggregate.
+    -- Bybit: the venue's cross sequence (order, not contiguity); first_id and
+    -- last_id are 0, and the trade's own id is the UUID in trade_id.
     agg_id         UInt64  CODEC(Delta(8), ZSTD(3)),
+    -- the venue's trade id when it is not a number (Bybit); empty otherwise.
+    -- Added by 005_trade_id.sql on tables created before it.
+    trade_id       String  CODEC(ZSTD(3)),
     first_id       UInt64  CODEC(Delta(8), ZSTD(3)),
     last_id        UInt64  CODEC(Delta(8), ZSTD(3)),
     price          Float64 CODEC(Gorilla, ZSTD(3)),
@@ -88,6 +93,10 @@ ORDER BY (exchange, symbol, event_time);
 -- Open interest has no WebSocket stream on Binance; it is polled over REST.
 -- It is also the weight in "median across 9 exchanges weighted by OI", so it is
 -- not optional decoration.
+-- open_interest is one side (longs = shorts), in the base coin, for every
+-- venue. Some venues report both sides summed (Bybit openInterest, Gate
+-- total_size, possibly Bitget and HTX): connectors halve or pick the
+-- single-side field, and keep the venue's own figures in extra.
 CREATE TABLE IF NOT EXISTS market.open_interest
 (
     exchange      LowCardinality(String),

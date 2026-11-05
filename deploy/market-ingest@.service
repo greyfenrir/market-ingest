@@ -2,7 +2,8 @@
 #   systemctl enable --now market-ingest@binance_um
 #
 # Template rather than one unit per exchange so adding Bybit is a symlink,
-# not a copy-paste of a file that then drifts.
+# not a copy-paste of a file that then drifts. The instance name is the
+# --exchange name, which is also the config section ([binance_um]).
 [Unit]
 Description=market data collector (%i)
 Documentation=https://github.com/greyfenrir/market-ingest

@@ -1,8 +1,10 @@
-import asyncio, logging, sys
+import asyncio, logging, re, sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
-from ingest.__main__ import run_until_stopped
+from ingest.__main__ import EXCHANGES, collector_class, exchange_config, run_until_stopped
+from ingest.exchanges.base import Collector
 
 logging.disable(logging.CRITICAL)
 
@@ -40,6 +42,29 @@ check("unexpected return gives non-zero exit", code, 1)
 code, task = asyncio.run(scenario(forever, stop_after=0.01))
 check("stop signal exits cleanly", code, 0)
 check("and cancels the collector", task.cancelled(), True)
+
+print("== exchanges: every registered name resolves to a collector")
+for name in EXCHANGES:
+    cls = collector_class(name)
+    check(f"{name} is a Collector", issubclass(cls, Collector), True)
+    check(f"{name} writes rows as '{name}'", cls.EXCHANGE, name)
+
+print("== config: an exchange runs only with its own section")
+check("section returned", exchange_config({"binance_um": {"focus_symbols": ["X"]}}, "binance_um"),
+      {"focus_symbols": ["X"]})
+for cfg in ({}, {"binance_um": "oops"}):
+    try: exchange_config(cfg, "binance_um"); got = None
+    except KeyError as e: got = e.args[0]
+    check(f"missing or malformed section is an error: {cfg}", got, "no [binance_um] section in the config")
+
+print("== netdata: alarms watch charts that exist, and name no exchange")
+charts = (ROOT / "deploy/netdata/market_ingest.conf").read_text()
+health = (ROOT / "deploy/netdata/health_market_ingest.conf").read_text()
+contexts = set(re.findall(r"^\s*context = (\S+)", charts, re.M))
+watched = re.findall(r"^\s*on: (\S+)", health, re.M)
+check("every alarm's chart is defined", sorted(set(watched) - contexts), [])
+check("every alarm is per dimension", len(re.findall(r"^\s*lookup:.*foreach \*$", health, re.M)), len(watched))
+check("no exchange named in alarms", [n for n in EXCHANGES if n in health], [])
 
 print()
 if fails:
