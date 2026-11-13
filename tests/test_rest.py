@@ -136,6 +136,20 @@ c, clock, events = client(100, t=6000.0)
 got = run(clock, c.get("/a", weight=20, still_wanted=lambda: False))
 check("returns None, no request, no weight", (got, c._session.calls, c.used()), (None, [], 0))
 
+print("== RestClient: optional proxy")
+class KwSession:
+    def __init__(self): self.kw = []
+    def get(self, url, **kw):
+        self.kw.append(kw)
+        return Resp(200, {})
+for proxy in ("http://u:p@h:3128", None):
+    c, clock, _ = client(100)
+    c.proxy = proxy
+    c._session = KwSession()
+    run(clock, c.get("/a"))
+    check(f"proxy={proxy!r} reaches the request only when set",
+          c._session.kw[0].get("proxy", "absent"), proxy or "absent")
+
 print()
 if fails:
     print(f"{len(fails)} FAILED"); sys.exit(1)

@@ -17,9 +17,10 @@
 -- levels; book_age_s lets the first minutes after a (re)start be cut out.
 --
 -- Notional is qty x contract size x mark price, in whole USD.
--- Column names must match ingest.book.LocalBook.aggregate exactly: JSONEachRow
--- rejects a whole batch over one unknown key (tests/test_binance_um_depth.py
--- checks the two against each other).
+-- Column names must match ingest.book.LocalBook.aggregate exactly
+-- (tests/test_binance_um_depth.py checks the two against each other): the
+-- sink cuts a key the table lacks, logs it and raises the unknown_columns
+-- alarm, and the rest of the row lands, but that value is lost.
 
 CREATE TABLE IF NOT EXISTS market.book_agg
 (

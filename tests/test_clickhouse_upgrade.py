@@ -69,6 +69,9 @@ class CaptureSink:
     def queued_rows(self) -> int:
         return 0
 
+    def unknown_columns(self) -> int:
+        return 0
+
 
 class QuietStats:
     def incr(self, *args, **kwargs) -> None:

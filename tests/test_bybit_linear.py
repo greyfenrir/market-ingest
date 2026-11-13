@@ -21,6 +21,7 @@ class FakeSink:
     def __init__(self): self.rows = []
     def write(self, table, row): self.rows.append((table, row))
     def queued_rows(self): return 0
+    def unknown_columns(self): return 0
     def of(self, table): return [r for t, r in self.rows if t == table]
 
 class FakeStatsd:
@@ -301,6 +302,65 @@ finally:
 check("subscriptions first, then a ping before each read", w.sent[:4], ["SUB1", "SUB2", "PING", "PING"])
 check("every message handled", got, [1, 2, 3])
 check("connection forgotten once closed", c._ws, {})
+
+print("== one bad trade in a batch costs only itself")
+c, sink = make()
+st = c._stat("agg_trade")
+good = lambda i: {"T": T0, "s": "BTCUSDT", "S": "Buy", "v": "1", "p": "1", "i": str(i), "seq": i}
+c._handle_trade({"data": [good(1), {**good(2), "p": None}, good(3)]}, T0 + 5, 100, st)
+check("the trades around it written", [r["trade_id"] for r in sink.of("market.trades")], ["1", "3"])
+check("counted", (st.rows, c.sd.counters["rows.bybit_linear.agg_trade"]), (2, 2))
+
+print("== a depth message that broke halfway: the live book is dropped and resubscribed")
+class SentWS:
+    def __init__(self): self.sent = []
+    async def send(self, m): self.sent.append(json.loads(m))
+c, sink = make()
+sync = c.depth["BTCUSDT"]
+sync.state = LIVE
+ws = c._ws["depth"] = SentWS()
+async def bad_then_settle():
+    c._on_bad_message("depth", {"topic": "orderbook.50.BTCUSDT", "data": {"s": "BTCUSDT"}})
+    await asyncio.gather(*c._bg)
+asyncio.run(bad_then_settle())
+check("book reset", sync.state, SYNCING)
+check("resync recorded", events(sink), [("depth", "resync", "BTCUSDT: bad message")])
+check("unsubscribed and subscribed again", [m["op"] for m in ws.sent], ["unsubscribe", "subscribe"])
+c._on_bad_message("depth", {"data": {"s": "BTCUSDT"}})     # already waiting for a snapshot
+c._on_bad_message("depth", {"data": []})
+c._on_bad_message("depth", None)
+c._on_bad_message("agg_trade", {"data": {"s": "BTCUSDT"}})
+check("anything else: untouched", (len(events(sink)), len(ws.sent)), (1, 2))
+
+print("== a book that keeps getting bad messages: the next resubscribe waits")
+import ingest.exchanges.bybit_linear as bl
+clock = [1000.0]
+real_time = bl.time
+bl.time = type("T", (), {"monotonic": staticmethod(lambda: clock[0]), "time": staticmethod(time.time)})
+c, sink = make()
+c._depth_open = True
+sync = c.depth["BTCUSDT"]
+ws = c._ws["depth"] = SentWS()
+async def bad():
+    c._on_bad_message("depth", {"data": {"s": "BTCUSDT"}})
+    await asyncio.gather(*c._bg)
+sync.state = LIVE
+asyncio.run(bad())
+sync.state = LIVE
+clock[0] += 0.2
+asyncio.run(bad())
+check("first resubscribed at once, the second not", [m["op"] for m in ws.sent], ["unsubscribe", "subscribe"])
+check("book dropped all the same", sync.state, SYNCING)
+async def watch(t):
+    n = c._depth_watch_pass(t)
+    await asyncio.gather(*c._bg)
+    return n
+check("the watchdog waits out the pause", asyncio.run(watch(clock[0] + 0.7)), 0)
+check("then resubscribes", asyncio.run(watch(clock[0] + 0.9)), 1)
+bl.time = real_time
+check("bad_messages counters primed", sorted(n for n in c._primed_counters() if n.startswith("bad_messages")),
+      ["bad_messages.bybit_linear.agg_trade", "bad_messages.bybit_linear.depth",
+       "bad_messages.bybit_linear.force_order", "bad_messages.bybit_linear.mark_price"])
 
 print()
 print("ALL PASSED" if not fails else f"FAILURES: {fails}")

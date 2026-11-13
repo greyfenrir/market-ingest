@@ -38,7 +38,8 @@ class RestClient:
                  used_header: str | None = None, limited_statuses=(418, 429),
                  timeout_s: float = 20.0, default_pause_s: float = 60.0,
                  on_event: Callable[[str, str, str], None] | None = None,
-                 wall: Callable[[], float] = time.time) -> None:
+                 wall: Callable[[], float] = time.time,
+                 proxy: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.budget = budget
         self.window_s = window_s
@@ -47,6 +48,7 @@ class RestClient:
         self.timeout = aiohttp.ClientTimeout(total=timeout_s)
         self.on_event = on_event
         self.wall = wall
+        self.proxy = proxy
         # How long to stop after a limit response without Retry-After
         self.default_pause_s = default_pause_s
         self._session: aiohttp.ClientSession | None = None
@@ -146,6 +148,8 @@ class RestClient:
             return None
         if self._session is None:
             self._session = aiohttp.ClientSession(timeout=self.timeout)
+        if self.proxy:
+            kw["proxy"] = self.proxy
         async with getattr(self._session, method)(self.base_url + path, **kw) as r:
             self._note_used(r.headers)
             if r.status in self.limited_statuses:

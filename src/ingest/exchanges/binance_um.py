@@ -53,9 +53,16 @@ KNOWN_MARK = {"e", "E", "s", "p", "i", "P", "r", "T"}
 KNOWN_AGG = {"e", "E", "s", "a", "p", "q", "f", "l", "T", "m", "M"}
 KNOWN_FORCE = {"s", "S", "o", "f", "q", "p", "ap", "X", "l", "z", "T"}
 
+# GET /fapi/v1/aggTrades: up to 1000 trades from an id, weight 20.
+AGG_TRADES_LIMIT = 1000
+AGG_TRADES_WEIGHT = 20
+# Failed requests in a row after which a gap's backfill gives up.
+BACKFILL_MAX_ERRORS = 5
+
 
 class BinanceUM(Collector):
     EXCHANGE = EXCHANGE
+    WS_STREAMS = ("mark_price", "agg_trade", "force_order")
 
     def __init__(self, cfg: dict, sink, *, focus: list[str], sd: Statsd) -> None:
         super().__init__(cfg, sink, focus=focus, sd=sd)
@@ -64,8 +71,11 @@ class BinanceUM(Collector):
         self._pending_minute: int = 0
         # Binance allows 2400 weight a minute per IP; the default leaves half
         # to whatever else runs from the same address.
+        # Optional HTTP CONNECT proxy for both the WebSockets and REST.
+        self.proxy = cfg.get("proxy") or None
         self.rest = RestClient(REST, budget=int(cfg.get("rest_weight_per_minute", 1200)),
-                               used_header=USED_WEIGHT, on_event=self._event)
+                               used_header=USED_WEIGHT, on_event=self._event,
+                               proxy=self.proxy)
 
         # Order book (stream A of the early-collector spec): a local book per
         # symbol, written as one aggregate row per second. Off unless enabled.
@@ -87,6 +97,17 @@ class BinanceUM(Collector):
         # the reset at the next open - 20 weight per book, every start.
         self._depth_open = False
 
+        # Trades the stream skipped, proven by an agg_id jump, are fetched
+        # over REST: aggregate ids are contiguous, so the hole is known
+        # exactly. Gaps wait in a queue for one worker, which spends at most
+        # backfill_budget_share of the REST budget, so order-book snapshots
+        # after a mass reconnect are not starved.
+        self.backfill = bool(cfg.get("backfill_gaps", True))
+        self.backfill_max_trades = int(cfg.get("backfill_max_trades_per_gap", 100_000))
+        self.backfill_share = float(cfg.get("backfill_budget_share", 0.5))
+        self.backfill_queue_max = int(cfg.get("backfill_queue_max", 1000))
+        self._gaps: asyncio.Queue[tuple[str, int, int]] = asyncio.Queue()
+
     # ------------------------------------------------------------ ws plumbing
 
     def _unwrap(self, payload):
@@ -97,6 +118,28 @@ class BinanceUM(Collector):
 
     # -------------------------------------------------------------- handlers
 
+    @staticmethod
+    def _mark_row(it: dict, recv_ms: float) -> dict:
+        """A market.mark_price row from one markPriceUpdate entry."""
+        sym = it["s"]
+        ev = float(it["E"])
+        return {
+            "exchange": EXCHANGE,
+            "symbol": sym,
+            "event_time": ch_ts(ev),
+            "ingest_time": ch_ts(recv_ms),
+            "mark_price": float(it.get("p", 0) or 0),
+            "index_price": float(it.get("i", 0) or 0),
+            "settle_price": float(it.get("P", 0) or 0),
+            "funding_rate": float(it.get("r", 0) or 0),
+            "next_funding_time": ch_ts(float(it.get("T", 0) or 0)),
+            # markPrice does not carry it; GET /fapi/v1/fundingInfo lists the
+            # symbols that are not on 8 h. Unknown until that is polled.
+            "funding_interval_h": 0,
+            "sampled": 0,
+            "extra": _extra(it, KNOWN_MARK),
+        }
+
     def _handle_mark(self, payload, recv_ms: float, nbytes: int, st: StreamStats) -> None:
         items = payload if isinstance(payload, list) else [payload]
         minute = int(recv_ms // 60000)
@@ -104,28 +147,19 @@ class BinanceUM(Collector):
             self._pending_minute = minute
 
         lag = None
+        good = 0
         for it in items:
-            if it.get("e") != "markPriceUpdate":
+            if not isinstance(it, dict) or it.get("e") != "markPriceUpdate":
                 continue
-            sym = it["s"]
-            ev = float(it["E"])
-            lag = int(recv_ms - ev)
-            row = {
-                "exchange": EXCHANGE,
-                "symbol": sym,
-                "event_time": ch_ts(ev),
-                "ingest_time": ch_ts(recv_ms),
-                "mark_price": float(it.get("p", 0) or 0),
-                "index_price": float(it.get("i", 0) or 0),
-                "settle_price": float(it.get("P", 0) or 0),
-                "funding_rate": float(it.get("r", 0) or 0),
-                "next_funding_time": ch_ts(float(it.get("T", 0) or 0)),
-                # markPrice does not carry it; GET /fapi/v1/fundingInfo lists the
-                # symbols that are not on 8 h. Unknown until that is polled.
-                "funding_interval_h": 0,
-                "sampled": 0,
-                "extra": _extra(it, KNOWN_MARK),
-            }
+            # One bad entry costs only itself, not the rest of the array.
+            try:
+                row = self._mark_row(it, recv_ms)
+            except Exception as exc:  # noqa: BLE001
+                self._bad_message("mark_price", it, None, exc)
+                continue
+            sym = row["symbol"]
+            lag = int(recv_ms - float(it["E"]))
+            good += 1
             if sym in self.focus:
                 self.sink.write("market.mark_price", row)
                 self._last_mark[sym] = row["mark_price"]
@@ -142,9 +176,11 @@ class BinanceUM(Collector):
             self._pending_mark.clear()
             self._pending_minute = minute
 
-        st.observe(nbytes=nbytes, rows=len(items), lag_ms=lag, symbol=None)
-        st.symbols.update(i.get("s", "") for i in items)
-        self._count_rows("mark_price", len(items))
+        if not good:
+            return      # nothing usable: let the stall watchdog see the silence
+        st.observe(nbytes=nbytes, rows=good, lag_ms=lag, symbol=None)
+        st.symbols.update(i.get("s", "") for i in items if isinstance(i, dict))
+        self._count_rows("mark_price", good)
         self.sd.incr(f"bytes.{EXCHANGE}.mark_price", nbytes)
         if lag is not None:
             self.sd.gauge(f"lag_ms.{EXCHANGE}.mark_price", max(0, lag))
@@ -155,6 +191,10 @@ class BinanceUM(Collector):
         sym = payload["s"]
         ev = float(payload["E"])
         agg_id = int(payload["a"])
+        # Built before the id is counted: a trade that cannot become a row
+        # must leave its id missing, so that the next one makes it a gap and
+        # the backfill fetches it.
+        row = self._trade_row(sym, payload, ev, recv_ms)
 
         missing, spans_reconnect = self.seq.check(sym, agg_id)
         if missing:
@@ -170,26 +210,116 @@ class BinanceUM(Collector):
                 "expected_id": agg_id - missing, "received_id": agg_id,
                 "missing": missing,
             })
+            self._queue_backfill(sym, agg_id - missing, agg_id - 1)
 
-        self.sink.write("market.trades", {
-            "exchange": EXCHANGE,
-            "symbol": sym,
-            "event_time": ch_ts(float(payload.get("T", ev))),
-            "ingest_time": ch_ts(recv_ms),
-            "agg_id": agg_id,
-            "first_id": int(payload.get("f", 0)),
-            "last_id": int(payload.get("l", 0)),
-            "price": float(payload["p"]),
-            "qty": float(payload["q"]),
-            "is_buyer_maker": 1 if payload.get("m") else 0,
-            "extra": _extra(payload, KNOWN_AGG),
-        })
+        self.sink.write("market.trades", row)
         st.observe(nbytes=nbytes, rows=1, lag_ms=int(recv_ms - ev), symbol=sym)
         self._count_rows("agg_trade", 1)
         self.sd.incr(f"bytes.{EXCHANGE}.agg_trade", nbytes)
         self.sd.gauge(f"lag_ms.{EXCHANGE}.agg_trade", max(0, int(recv_ms - ev)))
         if missing:
             self.sd.incr(f"gaps.{EXCHANGE}.agg_trade", missing)
+
+    @staticmethod
+    def _trade_row(sym: str, t: dict, ev: float, recv_ms: float) -> dict:
+        """A market.trades row from a stream aggTrade, or from a REST
+        aggTrades item (no e/E/s; ev is then its own T)."""
+        return {
+            "exchange": EXCHANGE,
+            "symbol": sym,
+            "event_time": ch_ts(float(t.get("T", ev))),
+            "ingest_time": ch_ts(recv_ms),
+            "agg_id": int(t["a"]),
+            "first_id": int(t.get("f", 0)),
+            "last_id": int(t.get("l", 0)),
+            "price": float(t["p"]),
+            "qty": float(t["q"]),
+            "is_buyer_maker": 1 if t.get("m") else 0,
+            "extra": _extra(t, KNOWN_AGG),
+        }
+
+    # ------------------------------------------------------------- backfill
+
+    def _queue_backfill(self, sym: str, first: int, last: int) -> None:
+        if not self.backfill:
+            return
+        if self._gaps.qsize() >= self.backfill_queue_max:
+            self._event("agg_trade", "backfill",
+                        f"{sym} {first}..{last}: queue full ({self.backfill_queue_max}), not recovered")
+            return
+        self._gaps.put_nowait((sym, first, last))
+
+    async def _backfill_loop(self) -> None:
+        while True:
+            sym, first, last = await self._gaps.get()
+            try:
+                await self._backfill_gap(sym, first, last)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the next gap still deserves a try
+                self._event("agg_trade", "backfill", f"{sym} {first}..{last}: failed: "
+                            f"{type(exc).__name__}: {exc}")
+                log.exception("%s backfill %d..%d failed", sym, first, last)
+
+    async def _backfill_turn(self) -> None:
+        """Wait until a request leaves the rest of the budget to everyone else."""
+        assert self.rest is not None
+        cap = self.rest.budget * self.backfill_share
+        while self.rest.used() + AGG_TRADES_WEIGHT > cap:
+            await asyncio.sleep(self.rest.window_left() + 0.1)
+
+    async def _backfill_gap(self, sym: str, first: int, last: int) -> int:
+        """Fetch agg ids first..last over REST and write them. Rows carry
+        "src":"rest" in extra; their ingest_time is when they were fetched,
+        which is the truth about when we knew them. Returns trades written."""
+        assert self.rest is not None
+        want = last - first + 1
+        if want > self.backfill_max_trades:
+            self._event("agg_trade", "backfill",
+                        f"{sym} {first}..{last}: {want} trades, over the limit of "
+                        f"{self.backfill_max_trades}; not recovered")
+            return 0
+        got, next_id, errors, requests = 0, first, 0, 0
+        while next_id <= last:
+            await self._backfill_turn()
+            try:
+                items = await self.rest.get(
+                    "/fapi/v1/aggTrades",
+                    {"symbol": sym, "fromId": next_id,
+                     "limit": min(AGG_TRADES_LIMIT, last - next_id + 1)},
+                    weight=AGG_TRADES_WEIGHT, stream="agg_trade", what=f"{sym} aggTrades")
+            except RateLimited:
+                continue        # the client holds every caller until the pause ends
+            except Exception as exc:  # noqa: BLE001
+                errors += 1
+                if errors >= BACKFILL_MAX_ERRORS:
+                    self._event("agg_trade", "backfill",
+                                f"{sym} {first}..{last}: {got}/{want} recovered, gave up "
+                                f"at {next_id}: {type(exc).__name__}: {exc}")
+                    return got
+                await asyncio.sleep(2 ** errors)
+                continue
+            errors = 0
+            requests += 1
+            recv_ms = now_ms()
+            top = next_id - 1
+            for t in items or ():
+                a = int(t["a"])
+                if a < next_id or a > last:
+                    continue
+                self.sink.write("market.trades",
+                                self._trade_row(sym, {**t, "src": "rest"}, 0.0, recv_ms))
+                got += 1
+                top = max(top, a)
+            if top < next_id:
+                break           # nothing at or after next_id: Binance has no more
+            next_id = top + 1
+        self._count_rows("agg_trade", got)
+        self.sd.incr(f"backfilled.{EXCHANGE}.agg_trade", got)
+        self._event("agg_trade", "backfill",
+                    f"{sym} {first}..{last}: {got}/{want} recovered in {requests} requests")
+        log.info("%s backfill %d..%d: %d/%d trades", sym, first, last, got, want)
+        return got
 
     def _handle_force(self, payload, recv_ms: float, nbytes: int, st: StreamStats) -> None:
         if payload.get("e") != "forceOrder":
@@ -239,6 +369,18 @@ class BinanceUM(Collector):
                 self._depth_resync(sync, "reconnect")
         self._depth_open = True
 
+    def _on_bad_message(self, stream: str, payload) -> None:
+        """A depth update that broke halfway may have changed part of a book:
+        start that book over. A message too broken to name its symbol leaves
+        a hole in the update ids, and the next event's `pu` check catches it."""
+        if stream != "depth" or not isinstance(payload, dict):
+            return
+        sync = self.depth.get(payload.get("s"))
+        if sync is not None and sync.state != SYNCING:
+            mono = time.monotonic()
+            self._depth_resync(sync, sync.reset("bad message"))
+            sync.not_before = mono + self._repair_hold(sync.symbol, mono)
+
     def _depth_on_close(self) -> None:
         """No stream, no snapshots: they could not be aligned with anything.
         Books keep their last state until the next open resets them, and the
@@ -273,10 +415,11 @@ class BinanceUM(Collector):
         if not self._depth_open:
             return 0
         started = 0
+        mono = time.monotonic()
         for sync in self.depth.values():
             # the book itself, or the shadow a refresh is building for it
             for target, owner in ((sync, None), (sync.shadow, sync)):
-                if target is not None and target.needs_snapshot:
+                if target is not None and target.needs_snapshot and mono >= target.not_before:
                     target.snapshot_pending = True
                     t = asyncio.create_task(self._fetch_snapshot(target, owner),
                                             name=f"snapshot:{sync.symbol}")
@@ -329,7 +472,13 @@ class BinanceUM(Collector):
                 continue
             if not wanted():
                 return  # the book was reset, or the shadow dropped, meanwhile
-            reason = sync.on_snapshot(snap, time.monotonic())
+            try:
+                reason = sync.on_snapshot(snap, time.monotonic())
+            except Exception as exc:  # noqa: BLE001 - a buffered event the replay could not take
+                # The book may hold half of it: start over. This loop's own
+                # pause paces the next snapshot.
+                self._bad_message("depth", f"(a buffered {sync.symbol} event)", None, exc)
+                reason = sync.reset(f"bad buffered event: {type(exc).__name__}: {exc}")
             if reason is None:
                 if owner is None:
                     self._event("depth", "snapshot", f"{sync.symbol} lastUpdateId={snap['lastUpdateId']}")
@@ -432,6 +581,8 @@ class BinanceUM(Collector):
             f"rows.{EXCHANGE}.force_order",
             f"rows.{EXCHANGE}.open_interest",
         ]
+        if self.backfill:
+            names.append(f"backfilled.{EXCHANGE}.agg_trade")
         if self.depth:
             names.append(f"refreshes.{EXCHANGE}.depth")
         return names + super()._primed_counters()
@@ -450,6 +601,8 @@ class BinanceUM(Collector):
                 "force_order", f"{WS_MARKET}/ws/!forceOrder@arr", self._handle_force),
             "open_interest": self._open_interest_loop(),
         }
+        if self.backfill:
+            work["agg_backfill"] = self._backfill_loop()
         if self.depth:
             # Separate connection on /public: depth is not served on /market,
             # and a stream on the wrong route is accepted and stays silent.

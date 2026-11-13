@@ -51,6 +51,9 @@ class DepthSync:
         self.state = SYNCING
         self.buffer: list[dict] = []
         self.snapshot_pending = False
+        # No snapshot is fetched before this monotonic time: the pause between
+        # repairs after bad messages (Collector._repair_hold).
+        self.not_before = 0.0
         # Bumped on every reset. A snapshot requested before a reset belongs
         # to a book that no longer exists; the connector compares generations
         # and throws such a response away instead of loading it.

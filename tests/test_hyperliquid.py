@@ -19,6 +19,7 @@ class FakeSink:
     def __init__(self): self.rows = []
     def write(self, table, row): self.rows.append((table, row))
     def queued_rows(self): return 0
+    def unknown_columns(self): return 0
     def of(self, table): return [r for t, r in self.rows if t == table]
 
 class FakeStatsd:

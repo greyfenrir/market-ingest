@@ -45,6 +45,8 @@ class FakeSession:
 
 
 def make(**kw):
+    # Column checks have tests of their own, below; FakeSession has no GET.
+    kw.setdefault("check_columns", False)
     return ClickHouseSink("http://x", "u", "p", **kw)
 
 
@@ -218,6 +220,139 @@ s._stop.set()
 run(s._run())
 check("drain finished, queue empty", len(s._queues["t"]), 0)
 check("rows behind the bad one went in", sorted(accepted(s._session)), [1, 2, 3, 4, 5])
+
+print("== a row key the table has no column for is reported and cut, the row kept")
+
+class TextResp(FakeResp):
+    def __init__(self, status, text="", raise_exc=None):
+        super().__init__(status, raise_exc)
+        self.body = text
+    async def text(self): return self.body
+
+
+class ColumnSession(FakeSession):
+    """FakeSession that also answers DESCRIBE TABLE over GET: with `columns`
+    as TSV, or with what `describe` holds (a status, or an exception)."""
+    def __init__(self, columns, describe=None):
+        super().__init__()
+        self.columns = list(columns)
+        self.describe = describe
+        self.queries = []
+    def get(self, url, params=None):
+        self.queries.append(params["query"])
+        d = self.describe
+        if isinstance(d, Exception):
+            return TextResp(0, raise_exc=d)
+        if isinstance(d, int):
+            return TextResp(d, "Code: 60. DB::Exception: Table t does not exist")
+        return TextResp(200, "".join(f"{c}\tString\t\t\t\t\t\n" for c in self.columns))
+
+
+def checked(columns, rows, describe=None):
+    s = ClickHouseSink("http://x", "u", "p")
+    s._session = ColumnSession(columns, describe)
+    for r in rows:
+        s.write("t", r)
+    return s
+
+s = checked(["i", "a"], [{"i": 0, "a": 1}, {"i": 1, "a": 2}])
+run(s._flush("t", s._queues["t"]))
+check("columns read once, by DESCRIBE", s._session.queries, ["DESCRIBE TABLE t FORMAT TSV"])
+check("matching rows go in untouched", s._session.bodies, ['{"i":0,"a":1}\n{"i":1,"a":2}'])
+check("nothing reported", (s.unknown, s.unknown_columns()), ({}, 0))
+s.write("t", {"i": 2, "a": 3})
+run(s._flush("t", s._queues["t"]))
+check("known columns are not read again", len(s._session.queries), 1)
+
+s = checked(["i"], [{"i": 0, "new": 1, "newer": 2}, {"i": 1, "new": 3}])
+run(s._flush("t", s._queues["t"]))
+check("unknown keys reported per table", s.unknown, {"t": {"new", "newer"}})
+check("counted for the alarm", s.unknown_columns(), 2)
+check("cut from the rows, which land", s._session.bodies, ['{"i":0}\n{"i":1}'])
+check("nothing dropped", (s.dropped_rows, s.inserted_rows), (0, 2))
+s.write("t", {"i": 2, "new": 4})
+run(s._flush("t", s._queues["t"]))
+check("not read again within a minute", len(s._session.queries), 1)
+check("both still reported, though this batch had one", s.unknown_columns(), 2)
+
+# the migration lands while the collector runs
+s._session.columns.append("new")
+s._columns_read["t"] -= 61
+s.write("t", {"i": 3, "new": 5})
+run(s._flush("t", s._queues["t"]))
+check("read again after a minute", len(s._session.queries), 2)
+check("migrated column now stored", s._session.bodies[-1], '{"i":3,"new":5}')
+check("only the migrated key cleared", (s.unknown, s.unknown_columns()), ({"t": {"newer"}}, 1))
+
+for name, describe in (("table missing (404)", 404), ("network down", ConnectionResetError("reset"))):
+    s = checked([], [{"i": 0, "x": 1}], describe=describe)
+    settled = run(s._flush("t", s._queues["t"]))
+    check(f"{name}: rows inserted unchecked", (settled, s._session.bodies), (True, ['{"i":0,"x":1}']))
+    check(f"{name}: nothing reported", s.unknown_columns(), 0)
+    s.write("t", {"i": 1})
+    run(s._flush("t", s._queues["t"]))
+    check(f"{name}: a failed read is not retried within a minute", len(s._session.queries), 1)
+
+print("== a key missing from some batches stays reported until the table has it")
+s = checked(["i"], [{"i": 0, "opt": 1}])
+run(s._flush("t", s._queues["t"]))
+s.write("t", {"i": 1})
+run(s._flush("t", s._queues["t"]))
+check("a batch without it does not clear it", s.unknown_columns(), 1)
+check("and is sent as it is", s._session.bodies[-1], '{"i":1}')
+s.write("t", {"i": 2, "other": 1})
+run(s._flush("t", s._queues["t"]))
+check("a second unknown key adds to the first", s.unknown, {"t": {"opt", "other"}})
+s._session.columns += ["opt", "other"]
+s._columns_read["t"] -= 601
+s.write("t", {"i": 3})
+run(s._flush("t", s._queues["t"]))
+check("cleared once the columns show them", (s.unknown, s.unknown_columns()), ({}, 0))
+
+print("== a column dropped under a running collector is noticed")
+s = checked(["i", "gone"], [{"i": 0, "gone": 1}])
+run(s._flush("t", s._queues["t"]))
+s._session.columns.remove("gone")
+s.write("t", {"i": 1, "gone": 2})
+run(s._flush("t", s._queues["t"]))
+check("not read again within ten minutes", len(s._session.queries), 1)
+s._columns_read["t"] -= 601
+s.write("t", {"i": 2, "gone": 3})
+run(s._flush("t", s._queues["t"]))
+check("read again after ten minutes", len(s._session.queries), 2)
+check("the dropped key reported and cut", (s.unknown, s._session.bodies[-1]), ({"t": {"gone"}}, '{"i":2}'))
+
+class StrictSession(ColumnSession):
+    """Refuses (400) an insert with a key the table has no column for, as
+    ClickHouse does with input_format_skip_unknown_fields = 0."""
+    def post(self, url, params=None, data=None):
+        body = data.decode()
+        keys = set().union(*(json.loads(l) for l in body.split("\n")))
+        if not keys <= set(self.columns):
+            self.bodies.append(body)
+            self.ok.append(False)
+            return FakeResp(400)
+        return super().post(url, params, data)
+
+s = ClickHouseSink("http://x", "u", "p")
+s._session = StrictSession(["i", "gone"])
+s.write("t", {"i": 0, "gone": 1})
+run(s._flush("t", s._queues["t"]))
+s._session.columns.remove("gone")
+s.write("t", {"i": 1, "gone": 2})
+s.write("t", {"i": 2, "gone": 3})
+settled = run(s._flush("t", s._queues["t"]))
+check("400: columns read again at once", len(s._session.queries), 2)
+check("rows fitted and sent again", s._session.bodies[-1], '{"i":1}\n{"i":2}')
+check("nothing dropped, nothing salvaged",
+      (settled, s.inserted_rows, s.rejected_rows, s.dropped_rows), (True, 3, 0, 0))
+
+rows = [{"i": i} for i in range(4)]
+rows[2]["bad"] = True
+s = checked(["i", "bad"], rows)
+run(s._flush("t", s._queues["t"]))
+check("400 the columns do not explain: salvaged as before",
+      (sorted(accepted(s._session)), s.rejected_rows), ([0, 1, 3], 1))
 
 print()
 print("ALL PASSED" if not fails else f"FAILURES: {fails}")

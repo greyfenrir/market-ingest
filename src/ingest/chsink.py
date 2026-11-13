@@ -22,6 +22,18 @@ Two properties matter more than throughput here:
    whatever the limit left unsearched, are dropped and counted. Every other failure
    - network, timeouts, overload, authentication (401/403), a table not created
    yet (404) - is fixed outside the data, so those rows wait and are retried.
+
+4. A row key the table has no column for is reported, not silently lost.
+   With input_format_skip_unknown_fields = 1 (the default on our servers)
+   ClickHouse drops such a key without a word: code released ahead of its
+   migration would write nothing into its new column, and nobody would know.
+   Before a table's first insert, again when a key it has not seen arrives,
+   every COLUMNS_TTL_S, and after an insert rejected with 400 (a column
+   dropped or renamed), the sink reads the table's columns (DESCRIBE TABLE).
+   A key that is
+   not among them is logged, counted in unknown_columns (alarmed in Netdata)
+   and cut from the rows, so the rows themselves land whatever the server's
+   setting. If the columns cannot be read, rows are inserted unchecked.
 """
 
 from __future__ import annotations
@@ -29,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from collections import deque
 from typing import Any
@@ -41,6 +54,12 @@ log = logging.getLogger(__name__)
 # range and syntax errors (exceptionCodeToHTTPStatus.cpp). Not for missing
 # tables (404), access (401/403), timeouts (408) or load (500/503).
 REJECTED = 400
+# Columns of a table are read again at most this often, when a key arrives
+# that they do not have: a migration applied while the collector runs is seen.
+COLUMNS_RECHECK_S = 60.0
+# ...and at least this often anyway: a column dropped or renamed under a
+# running collector loses its values silently too.
+COLUMNS_TTL_S = 600.0
 
 
 class _Retry(Exception):
@@ -58,6 +77,7 @@ class ClickHouseSink:
         batch_max_seconds: float = 2.0,
         queue_max_rows: int = 400_000,
         salvage_max_inserts: int = 128,
+        check_columns: bool = True,
     ) -> None:
         self._url = url.rstrip("/")
         self._auth = aiohttp.BasicAuth(user, password)
@@ -79,6 +99,12 @@ class ClickHouseSink:
         self.insert_errors = 0
         self.inserted_rows = 0
 
+        self._check_columns = check_columns
+        self._columns: dict[str, set[str]] = {}     # table -> its columns, as last read
+        self._columns_read: dict[str, float] = {}   # table -> monotonic time of that read
+        # table -> keys the rows carry that the table has no column for
+        self.unknown: dict[str, set[str]] = {}
+
     # ------------------------------------------------------------------ api
 
     def write(self, table: str, row: dict[str, Any]) -> None:
@@ -99,6 +125,10 @@ class ClickHouseSink:
         """Rows waiting to be inserted. Growth here is the earliest visible
         sign that ClickHouse is struggling, well before anything errors."""
         return sum(len(q) for q in self._queues.values())
+
+    def unknown_columns(self) -> int:
+        """Row keys, over all tables, that ClickHouse has no column for."""
+        return sum(len(k) for k in self.unknown.values())
 
     async def start(self) -> None:
         timeout = aiohttp.ClientTimeout(total=30)
@@ -149,8 +179,19 @@ class ClickHouseSink:
         (inserted, or rejected and dropped), False if it went back to wait."""
         n = min(len(q), self._batch_max_rows)
         rows = [q.popleft() for _ in range(n)]
+        if self._check_columns:
+            rows = await self._fit_columns(table, rows)
         try:
             error = await self._insert(table, rows)
+            if error is not None and self._check_columns:
+                # Maybe the schema changed under us: fit the rows to the
+                # columns as they are now, and if that cut anything, try again.
+                fitted = await self._fit_columns(table, rows, force=True)
+                if fitted is not rows:
+                    log.warning("insert into %s rejected, retrying with the columns "
+                                "read again: %s", table, error)
+                    rows = fitted
+                    error = await self._insert(table, rows)
             if error is None:
                 return True
             self.insert_errors += 1
@@ -165,6 +206,57 @@ class ClickHouseSink:
             log.warning("insert into %s failed (%d rows requeued): %s", table, len(left), exc.args[0])
             await asyncio.sleep(1.0)
             return False
+
+    async def _fit_columns(self, table: str, rows: list, force: bool = False) -> list:
+        """The rows with every key the table has no column for cut out, and
+        the loss reported. The very list passed in comes back when nothing
+        was cut, or while the table's columns are unknown. force reads the
+        columns again whatever the limits."""
+        keys = set().union(*rows)
+        cols = self._columns.get(table)
+        mono = time.monotonic()
+        age = mono - self._columns_read.get(table, -math.inf)
+        if (force or age >= COLUMNS_TTL_S
+                or ((cols is None or not keys <= cols) and age >= COLUMNS_RECHECK_S)):
+            self._columns_read[table] = mono
+            fresh = await self._read_columns(table)
+            if fresh is not None:
+                self._columns[table] = cols = fresh
+        if cols is None:
+            return rows
+        before = self.unknown.get(table, set())
+        new = keys - cols - before
+        # A key stays reported until the table's columns show it: a batch
+        # that happens not to carry it proves nothing.
+        unknown = (before - cols) | new
+        if new:
+            log.error("%s has no column for %s: these values are NOT stored until the "
+                      "schema is migrated (the rows themselves are)", table, sorted(new))
+        if before - unknown:
+            log.warning("%s now has a column for %s", table, sorted(before - unknown))
+        if not unknown:
+            self.unknown.pop(table, None)
+            return rows
+        self.unknown[table] = unknown
+        if keys.isdisjoint(unknown):
+            return rows
+        return [{k: v for k, v in r.items() if k not in unknown} for r in rows]
+
+    async def _read_columns(self, table: str) -> set[str] | None:
+        """The table's column names, or None if they cannot be read now."""
+        assert self._session is not None
+        params = {"query": f"DESCRIBE TABLE {table} FORMAT TSV"}
+        try:
+            async with self._session.get(self._url, params=params) as r:
+                text = await r.text()
+                status = r.status
+        except Exception as exc:  # noqa: BLE001 - checking must never stop the insert
+            log.warning("cannot read the columns of %s: %s: %s", table, type(exc).__name__, exc)
+            return None
+        if status != 200:
+            log.error("cannot read the columns of %s (HTTP %d): %s", table, status, text[:300])
+            return None
+        return {line.split("\t", 1)[0] for line in text.splitlines() if line}
 
     async def _insert(self, table: str, rows: list) -> str | None:
         """One INSERT. None when it went in, ClickHouse's message when it was

@@ -44,6 +44,43 @@ log = logging.getLogger(__name__)
 # Window of the per-book quality share that the Netdata alarm watches.
 BOOK_QUALITY_WINDOW_S = 600
 
+# Reconnect backoff: doubles from 0.5 s, +-50 % jitter, never above 60 s.
+BACKOFF_BASE_S = 0.5
+BACKOFF_MAX_S = 60.0
+# Handshake answers that mean "this IP is connecting too often" (Binance 418
+# and 429, Bybit 403). Without Retry-After, wait at least this long.
+LIMIT_STATUSES = (403, 418, 429)
+LIMIT_PAUSE_S = 60.0
+# A stream reports messages its handler could not take at most this often.
+BAD_MESSAGE_REPORT_S = 60.0
+# Repairs of one order book after bad messages: 1, 2, 4 ... 60 s apart, the
+# count starting over once the book has gone this long without one. A venue
+# that broke its format would otherwise get a snapshot request or a
+# resubscribe for every message it sends.
+REPAIR_CALM_S = 300.0
+# The stream whose ids self.seq follows.
+SEQ_STREAM = "agg_trade"
+
+
+def backoff_delay(attempt: int, rnd: float) -> float:
+    """Pause before reconnect number `attempt` (1 = the first after a
+    connection that lasted); rnd is uniform in [0, 1)."""
+    return min(BACKOFF_MAX_S, BACKOFF_BASE_S * 2 ** min(attempt, 16) * (0.5 + rnd))
+
+
+def handshake_limit(exc: BaseException) -> tuple[int, float] | None:
+    """(status, seconds to wait) if the venue refused the WebSocket handshake
+    with a limit status, else None."""
+    resp = getattr(exc, "response", None)      # websockets.InvalidStatus
+    status = getattr(resp, "status_code", None)
+    if status not in LIMIT_STATUSES:
+        return None
+    try:
+        wait = float(resp.headers.get("Retry-After") or LIMIT_PAUSE_S)
+    except (AttributeError, TypeError, ValueError):
+        wait = LIMIT_PAUSE_S
+    return status, max(wait, LIMIT_PAUSE_S)
+
 
 def extra_fields(payload: dict, known: set[str]) -> str:
     """Fields the schema does not model, kept verbatim: an archive that drops
@@ -57,6 +94,8 @@ class Collector:
     self.depth via _init_books(), and implement _coroutines()."""
 
     EXCHANGE = ""
+    # WebSocket streams besides depth; their bad_messages counters are primed.
+    WS_STREAMS: tuple[str, ...] = ()
 
     def __init__(self, cfg: dict, sink, *, focus: list[str], sd: Statsd) -> None:
         self.sink = sink
@@ -66,6 +105,19 @@ class Collector:
         self.session_id = new_session_id()
         self.stall = cfg.get("stall_seconds", {})
         self.reconnect_after = cfg.get("reconnect_after_hours", 23) * 3600
+        # A connection that lasted this long counts as a success, and the
+        # backoff after it starts over.
+        self.reconnect_reset_s = float(cfg.get("reconnect_reset_after_seconds", 60))
+        # WebSocket keepalive. A pong late by more than the timeout closes the
+        # connection. Binance delivers late, but whole, for up to ~30 s quite
+        # often (prod, Nov 2026): a shorter timeout turns those into losses.
+        self.ws_ping_interval = float(cfg.get("ws_ping_interval_seconds", 20))
+        self.ws_ping_timeout = float(cfg.get("ws_ping_timeout_seconds", 20))
+        # per stream: [messages skipped since the last report, monotonic time of it]
+        self._bad: dict[str, list[float]] = {}
+        self._repairs: dict[str, tuple[float, int]] = {}   # symbol -> (last repair, count)
+        # HTTP CONNECT proxy for the WebSocket; None keeps websockets' default
+        self.proxy: str | None = None
         self.collector_version = os.environ.get("COLLECTOR_VERSION", "")
 
         self.seq = SequenceTracker()
@@ -140,6 +192,7 @@ class Collector:
         self.sd.gauge(f"queue_rows.{ex}", self.sink.queued_rows())
         self.sd.gauge(f"insert_errors.{ex}", self.sink.insert_errors)
         self.sd.gauge(f"dropped_rows.{ex}", self.sink.dropped_rows)
+        self.sd.gauge(f"unknown_columns.{ex}", self.sink.unknown_columns())
         if self.rest:
             self.sd.gauge(f"rest_used_pct.{ex}", round(100 * self.rest.used() / self.rest.budget))
 
@@ -167,14 +220,19 @@ class Collector:
         attempt = 0
         while True:
             started = time.monotonic()
+            opened: float | None = None
+            floor = 0.0
             st = self._stat(stream)
             try:
                 self._event(stream, "start", url)
+                # Only passed when set: proxy=None would turn off the
+                # environment proxy that connectors without one get today.
+                kw = {"proxy": self.proxy} if self.proxy else {}
                 async with websockets.connect(
-                    url, open_timeout=20, ping_interval=20, ping_timeout=20,
-                    max_size=16 * 1024 * 1024,
+                    url, open_timeout=20, ping_interval=self.ws_ping_interval,
+                    ping_timeout=self.ws_ping_timeout, max_size=16 * 1024 * 1024, **kw,
                 ) as ws:
-                    attempt = 0
+                    opened = time.monotonic()
                     st.last_msg_monotonic = time.monotonic()
                     self._event(stream, "open")
                     log.info("%s connected", stream)
@@ -190,15 +248,31 @@ class Collector:
             except Exception as exc:  # noqa: BLE001
                 self._event(stream, "error", f"{type(exc).__name__}: {exc}")
                 log.warning("%s error: %s", stream, exc)
+                limited = handshake_limit(exc)
+                if limited:
+                    status, floor = limited
+                    self._event(stream, "rate_limit",
+                                f"handshake HTTP {status}, next attempt in {floor:.0f}s or later")
+                    log.error("%s: handshake refused with HTTP %d, waiting %.0fs",
+                              stream, status, floor)
             finally:
                 self._ws.pop(stream, None)
                 if on_close:
                     on_close()
             # Keep the sequence state: the jump across this reconnect is the
-            # measurement of what the outage cost us.
-            self.seq.mark_reconnect()
+            # measurement of what the outage cost us. Only the trade stream
+            # feeds the tracker; another stream's reconnect would tag a gap
+            # on a trade connection that never dropped.
+            if stream == SEQ_STREAM:
+                self.seq.mark_reconnect()
+            # Only a connection that lasted starts the backoff over. A venue
+            # that accepts and at once drops every connection (or a message
+            # that breaks the stream each time) would otherwise be reconnected
+            # to about once a second, which is how an IP ban is earned.
+            if opened is not None and time.monotonic() - opened >= self.reconnect_reset_s:
+                attempt = 0
             attempt += 1
-            delay = min(60.0, (2 ** min(attempt, 6)) * 0.5) * (0.5 + random.random())
+            delay = max(floor, backoff_delay(attempt, random.random()))
             self._event(stream, "reconnect", f"attempt={attempt} in {delay:.1f}s")
             await asyncio.sleep(delay)
 
@@ -228,10 +302,66 @@ class Collector:
                 self._roll_health()
                 continue
             recv_ms = now_ms()
-            payload = self._unwrap(json.loads(raw))
-            if payload is not None:     # None: a control message, already handled
-                handle(payload, recv_ms, len(raw), st)
+            payload = None
+            try:
+                payload = self._unwrap(json.loads(raw))
+                if payload is not None:     # None: a control message, already handled
+                    handle(payload, recv_ms, len(raw), st)
+            except Exception as exc:  # noqa: BLE001 - one message must not end the stream
+                self._bad_message(stream, raw, payload, exc)
+            # Checked here too: a stream whose every message fails never goes
+            # quiet for the 5 s recv timeout, yet produces nothing.
+            if st.silent_for() > stall_after:
+                self._event(stream, "stall",
+                            f"no usable messages for {st.silent_for():.0f}s (limit {stall_after:.0f}s)")
+                log.error("%s produced nothing for %.0fs, reconnecting", stream, st.silent_for())
+                return
             self._roll_health()
+
+    def _bad_message(self, stream: str, raw, payload, exc: Exception) -> None:
+        """A message the stream's handler could not take: skip it and count it.
+
+        Raised out of _consume it would close the connection, lose everything
+        sent during the reconnect, and with a venue that keeps sending the same
+        malformed message, close it again at once. Every skip is counted in
+        StatsD; ops.connection_events gets one row per BAD_MESSAGE_REPORT_S at
+        most, with the latest error and message, so a parser broken for every
+        message cannot flood it. Such a stream also stops producing rows, and
+        its stall watchdog and the Netdata stall alarm see that."""
+        self.sd.incr(f"bad_messages.{self.EXCHANGE}.{stream}", 1)
+        b = self._bad.setdefault(stream, [0, -math.inf])
+        b[0] += 1
+        mono = time.monotonic()
+        if mono - b[1] >= BAD_MESSAGE_REPORT_S:
+            text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+            self._event(stream, "bad_message",
+                        f"{int(b[0])} skipped since the last report; latest: "
+                        f"{type(exc).__name__}: {exc}; message: {text[:300]}")
+            log.error("%s: skipped a message the handler could not take (%d since the "
+                      "last report)", stream, b[0], exc_info=exc)
+            b[0], b[1] = 0, mono
+        try:
+            self._on_bad_message(stream, payload)
+        except Exception:  # noqa: BLE001
+            log.exception("%s: repair after a bad message failed", stream)
+
+    def _on_bad_message(self, stream: str, payload) -> None:
+        """Repair state a half-handled message may have left behind. payload
+        is the decoded message, or None if it did not even decode. A venue
+        whose order book could have taken half an update resets it here."""
+
+    def _repair_hold(self, symbol: str, mono: float) -> float:
+        """Seconds the book of `symbol` must wait before its next repair
+        after a bad message. 0 means repair now, and counts the repair."""
+        last, n = self._repairs.get(symbol, (-math.inf, 0))
+        if mono - last >= REPAIR_CALM_S:
+            n = 0
+        elif n:
+            wait = last + min(BACKOFF_MAX_S, 2.0 ** (n - 1)) - mono
+            if wait > 0:
+                return wait
+        self._repairs[symbol] = (mono, n + 1)
+        return 0.0
 
     # ----------------------------------------------------------- order book
 
@@ -353,8 +483,11 @@ class Collector:
         alarms watching them exist before anything goes wrong."""
         ex = self.EXCHANGE
         names = [f"rows_total.{ex}"]
+        names += [f"bad_messages.{ex}.{s}" for s in self.WS_STREAMS]
         if self.depth:
             names += [f"rows.{ex}.book_agg", f"resyncs.{ex}.depth"]
+            if self.WS_STREAMS:
+                names.append(f"bad_messages.{ex}.depth")
         return names
 
     async def _startup(self) -> None:

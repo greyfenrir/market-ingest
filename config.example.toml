@@ -60,10 +60,30 @@ open_interest_symbols      = "focus"   # "focus" or "all"
 # from it; the collector follows Binance's own count when it is higher.
 rest_weight_per_minute = 1200
 
+# Optional HTTP CONNECT proxy for this collector's WebSockets and REST calls.
+# Basic auth travels in clear text: restrict the proxy by firewall to this host's IP.
+# proxy = "http://user:pass@host:3128"
+
 # Binance drops WebSocket connections after 24h. Beat it to the punch.
 # (Must stay above the first [binance_um.*] header: TOML would otherwise file
 # it under that table, where nothing reads it.)
 reconnect_after_hours = 23
+
+# Reconnect pauses double from 0.5 s up to 60 s, and start over only after a
+# connection that lasted this long: a venue that drops every connection at
+# once is not hammered. Every exchange section takes these three keys.
+# reconnect_reset_after_seconds = 60
+# WebSocket ping. Binance often delivers late but whole for up to ~30 s; a
+# shorter timeout would turn those delays into losses.
+# ws_ping_interval_seconds = 20
+# ws_ping_timeout_seconds  = 20
+
+# Trades the stream skipped (an agg_id jump, in ops.sequence_gaps) are fetched
+# over REST /fapi/v1/aggTrades (weight 20 per 1000), spending no more than
+# backfill_budget_share of rest_weight_per_minute.
+backfill_gaps               = true
+backfill_max_trades_per_gap = 100000
+backfill_budget_share       = 0.5
 
 # A stream that goes quiet for longer than this is treated as broken and
 # reconnected. Silence is the failure mode that looks like success.
