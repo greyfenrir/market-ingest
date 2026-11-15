@@ -84,6 +84,8 @@ reconnect_after_hours = 23
 backfill_gaps               = true
 backfill_max_trades_per_gap = 100000
 backfill_budget_share       = 0.5
+# Seconds a gap waits before its request: late trades arrive by the stream meanwhile.
+backfill_delay_s            = 10
 
 # A stream that goes quiet for longer than this is treated as broken and
 # reconnected. Silence is the failure mode that looks like success.

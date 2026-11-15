@@ -209,6 +209,51 @@ got, pauses = backfill(c, "BTCUSDT", 10, 11)
 check("leaves half the budget to snapshots: waits for the next window", pauses, [7.1])
 check("then fetches", got, 2)
 
+print("== a skipped trade the stream delivers late is not written twice")
+c, sink = make()
+agg(100); agg(105)
+c.rest = FakeRest(0, 10**6)
+backfill(c, "BTCUSDT", *c._gaps.get_nowait()[1:])
+agg(103); agg(106)
+ids = sorted(r["agg_id"] for r in sink.of("market.trades"))
+check("the backfilled id comes once", ids, [100, 101, 102, 103, 104, 105, 106])
+agg(100)
+check("a repeat outside any gap is stored as before", len(sink.of("market.trades")), 8)
+
+c, sink = make()
+agg(100); agg(105)
+c.rest = FakeRest(0, 102)       # Binance has nothing past 102
+backfill(c, "BTCUSDT", *c._gaps.get_nowait()[1:])
+agg(102); agg(104)
+ids = sorted(r["agg_id"] for r in sink.of("market.trades"))
+check("what the backfill did not get is taken from the stream", ids, [100, 101, 102, 104, 105])
+
+c, sink = make()
+agg(100); agg(105); agg(102)
+c.rest = FakeRest(0, 10**6)
+got, _ = backfill(c, "BTCUSDT", *c._gaps.get_nowait()[1:])
+rows = sink.of("market.trades")
+check("late before the request: the stream's row is kept, the rest fetched",
+      (sorted(r["agg_id"] for r in rows), [r["agg_id"] for r in rows if "rest" in r["extra"]], got),
+      ([100, 101, 102, 103, 104, 105], [101, 103, 104], 3))
+check("and reported", backfill_events(sink), ["BTCUSDT 101..104: 3/3 recovered in 1 requests, 1 came late by stream"])
+agg(102)
+check("a second copy of it is dropped", len(sink.of("market.trades")), 6)
+
+c, sink = make()
+agg(100); agg(103); agg(101); agg(102)
+c.rest = FakeRest(0, 10**6)
+got, _ = backfill(c, "BTCUSDT", *c._gaps.get_nowait()[1:])
+check("everything came late: no request at all", (got, c.rest.calls, len(sink.of("market.trades"))), (0, [], 4))
+
+c, sink = make({"backfill_max_trades_per_gap": 2})
+agg(100); agg(105)
+c.rest = FakeRest(0, 10**6)
+backfill(c, "BTCUSDT", *c._gaps.get_nowait()[1:])
+agg(103)
+check("a gap not fetched at all leaves its ids to the stream",
+      sorted(r["agg_id"] for r in sink.of("market.trades")), [100, 103, 105])
+
 c, sink = make({"backfill_queue_max": 2})
 for i in range(3):
     c._queue_backfill("BTCUSDT", i * 10, i * 10 + 5)

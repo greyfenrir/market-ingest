@@ -56,8 +56,21 @@ KNOWN_FORCE = {"s", "S", "o", "f", "q", "p", "ap", "X", "l", "z", "T"}
 # GET /fapi/v1/aggTrades: up to 1000 trades from an id, weight 20.
 AGG_TRADES_LIMIT = 1000
 AGG_TRADES_WEIGHT = 20
+# Gaps remembered per symbol, to tell their late arrivals from the stream.
+GAPS_KEPT = 64
 # Failed requests in a row after which a gap's backfill gives up.
 BACKFILL_MAX_ERRORS = 5
+
+
+class _Gap:
+    """Agg ids first..last the stream skipped. `late` are those it delivered
+    after all; ids up to `done_to` have been through the backfill."""
+    __slots__ = ("first", "last", "done_to", "late", "at")
+
+    def __init__(self, first: int, last: int) -> None:
+        self.first, self.last, self.done_to = first, last, first - 1
+        self.late: set[int] = set()
+        self.at = time.monotonic()
 
 
 class BinanceUM(Collector):
@@ -106,7 +119,14 @@ class BinanceUM(Collector):
         self.backfill_max_trades = int(cfg.get("backfill_max_trades_per_gap", 100_000))
         self.backfill_share = float(cfg.get("backfill_budget_share", 0.5))
         self.backfill_queue_max = int(cfg.get("backfill_queue_max", 1000))
+        # A gap waits this long before its request: trades that were only
+        # late arrive by the stream meanwhile and need no request, and REST
+        # has the rest by then.
+        self.backfill_delay = float(cfg.get("backfill_delay_s", 10))
         self._gaps: asyncio.Queue[tuple[str, int, int]] = asyncio.Queue()
+        # Stream and backfill must not both write an id (market.trades does
+        # not collapse repeats): whichever has it first writes it.
+        self._gap_log: dict[str, list[_Gap]] = {}
 
     # ------------------------------------------------------------ ws plumbing
 
@@ -211,6 +231,15 @@ class BinanceUM(Collector):
                 "missing": missing,
             })
             self._queue_backfill(sym, agg_id - missing, agg_id - 1)
+        else:
+            gap = next((g for g in self._gap_log.get(sym, ())
+                        if g.first <= agg_id <= g.last), None)
+            if gap is not None:     # a skipped trade, here after all
+                self.sd.incr(f"late.{EXCHANGE}.agg_trade")
+                if agg_id <= gap.done_to or agg_id in gap.late:
+                    st.observe(nbytes=nbytes, rows=0, lag_ms=None, symbol=sym)
+                    return          # already written
+                gap.late.add(agg_id)
 
         self.sink.write("market.trades", row)
         st.observe(nbytes=nbytes, rows=1, lag_ms=int(recv_ms - ev), symbol=sym)
@@ -248,11 +277,22 @@ class BinanceUM(Collector):
                         f"{sym} {first}..{last}: queue full ({self.backfill_queue_max}), not recovered")
             return
         self._gaps.put_nowait((sym, first, last))
+        log_ = self._gap_log.setdefault(sym, [])
+        log_.append(_Gap(first, last))
+        del log_[:-GAPS_KEPT]
+
+    def _gap(self, sym: str, first: int, last: int) -> _Gap | None:
+        return next((g for g in self._gap_log.get(sym, ())
+                     if (g.first, g.last) == (first, last)), None)
 
     async def _backfill_loop(self) -> None:
         while True:
             sym, first, last = await self._gaps.get()
             try:
+                gap = self._gap(sym, first, last)
+                wait = (gap.at + self.backfill_delay - time.monotonic()) if gap else 0
+                if wait > 0:
+                    await asyncio.sleep(wait)
                 await self._backfill_gap(sym, first, last)
             except asyncio.CancelledError:
                 raise
@@ -269,18 +309,25 @@ class BinanceUM(Collector):
             await asyncio.sleep(self.rest.window_left() + 0.1)
 
     async def _backfill_gap(self, sym: str, first: int, last: int) -> int:
-        """Fetch agg ids first..last over REST and write them. Rows carry
+        """Fetch agg ids first..last over REST and write them, except those
+        the stream has delivered late. Rows carry
         "src":"rest" in extra; their ingest_time is when they were fetched,
         which is the truth about when we knew them. Returns trades written."""
         assert self.rest is not None
-        want = last - first + 1
+        gap = self._gap(sym, first, last) or _Gap(first, last)
+        want = last - first + 1 - len(gap.late)
         if want > self.backfill_max_trades:
             self._event("agg_trade", "backfill",
                         f"{sym} {first}..{last}: {want} trades, over the limit of "
                         f"{self.backfill_max_trades}; not recovered")
             return 0
         got, next_id, errors, requests = 0, first, 0, 0
-        while next_id <= last:
+        while True:
+            while next_id in gap.late:
+                next_id += 1
+            gap.done_to = next_id - 1
+            if next_id > last:
+                break
             await self._backfill_turn()
             try:
                 items = await self.rest.get(
@@ -307,17 +354,20 @@ class BinanceUM(Collector):
                 a = int(t["a"])
                 if a < next_id or a > last:
                     continue
+                top = max(top, a)
+                if a in gap.late:
+                    continue
                 self.sink.write("market.trades",
                                 self._trade_row(sym, {**t, "src": "rest"}, 0.0, recv_ms))
                 got += 1
-                top = max(top, a)
             if top < next_id:
                 break           # nothing at or after next_id: Binance has no more
             next_id = top + 1
         self._count_rows("agg_trade", got)
         self.sd.incr(f"backfilled.{EXCHANGE}.agg_trade", got)
         self._event("agg_trade", "backfill",
-                    f"{sym} {first}..{last}: {got}/{want} recovered in {requests} requests")
+                    f"{sym} {first}..{last}: {got}/{want} recovered in {requests} requests"
+                    + (f", {len(gap.late)} came late by stream" if gap.late else ""))
         log.info("%s backfill %d..%d: %d/%d trades", sym, first, last, got, want)
         return got
 
@@ -583,6 +633,7 @@ class BinanceUM(Collector):
         ]
         if self.backfill:
             names.append(f"backfilled.{EXCHANGE}.agg_trade")
+            names.append(f"late.{EXCHANGE}.agg_trade")
         if self.depth:
             names.append(f"refreshes.{EXCHANGE}.depth")
         return names + super()._primed_counters()
