@@ -13,6 +13,7 @@
 | `bybit_selfcheck.py` | код стакана Bybit на всех 1000 уровнях, в том числе BTC и ETH | свежий снимок Bybit по второму соединению |
 | `bybit_record_ob200.py` | вспомогательный: пишет живой поток `orderbook.200` в формате архива | — |
 | `hyperliquid_check_funding.py` | фандинг и `premium` Hyperliquid | `fundingHistory` |
+| `hyperliquid_compare_asset_ctxs.py` | OI, mark, оракул, mid и фандинг Hyperliquid поминутно (только основной DEX, без HIP-3) | архив `asset_ctxs` в S3 (`aws`, requester-pays; нужен `lz4`) |
 | `hyperliquid_cross_venue.py` | оракул, mark, фандинг Hyperliquid, масштаб `k`-монет | Binance и Bybit из нашей же базы |
 | `hyperliquid_check_rows.py` | правила внутри строки, полнота опросов | правила самого Hyperliquid |
 | `binance_bybit_check_funding.py` | ставка перед выплатой и расписание фандинга | история выплат бирж |
