@@ -56,7 +56,7 @@ KNOWN_FORCE = {"s", "S", "o", "f", "q", "p", "ap", "X", "l", "z", "T"}
 # GET /fapi/v1/aggTrades: up to 1000 trades from an id, weight 20.
 AGG_TRADES_LIMIT = 1000
 AGG_TRADES_WEIGHT = 20
-# Gaps remembered per symbol, to tell their late arrivals from the stream.
+# Completed gaps remembered per symbol, besides all queued and in-flight gaps.
 GAPS_KEPT = 64
 # Failed requests in a row after which a gap's backfill gives up.
 BACKFILL_MAX_ERRORS = 5
@@ -65,12 +65,13 @@ BACKFILL_MAX_ERRORS = 5
 class _Gap:
     """Agg ids first..last the stream skipped. `late` are those it delivered
     after all; ids up to `done_to` have been through the backfill."""
-    __slots__ = ("first", "last", "done_to", "late", "at")
+    __slots__ = ("first", "last", "done_to", "late", "at", "pending")
 
     def __init__(self, first: int, last: int) -> None:
         self.first, self.last, self.done_to = first, last, first - 1
         self.late: set[int] = set()
         self.at = time.monotonic()
+        self.pending = True
 
 
 class BinanceUM(Collector):
@@ -87,8 +88,8 @@ class BinanceUM(Collector):
         # Optional HTTP CONNECT proxy for both the WebSockets and REST.
         self.proxy = cfg.get("proxy") or None
         self.rest = RestClient(REST, budget=int(cfg.get("rest_weight_per_minute", 1200)),
-                               used_header=USED_WEIGHT, on_event=self._event,
-                               proxy=self.proxy)
+                              used_header=USED_WEIGHT, on_event=self._event,
+                              proxy=self.proxy)
 
         # Order book (stream A of the early-collector spec): a local book per
         # symbol, written as one aggregate row per second. Off unless enabled.
@@ -279,7 +280,6 @@ class BinanceUM(Collector):
         self._gaps.put_nowait((sym, first, last))
         log_ = self._gap_log.setdefault(sym, [])
         log_.append(_Gap(first, last))
-        del log_[:-GAPS_KEPT]
 
     def _gap(self, sym: str, first: int, last: int) -> _Gap | None:
         return next((g for g in self._gap_log.get(sym, ())
@@ -313,8 +313,20 @@ class BinanceUM(Collector):
         the stream has delivered late. Rows carry
         "src":"rest" in extra; their ingest_time is when they were fetched,
         which is the truth about when we knew them. Returns trades written."""
-        assert self.rest is not None
         gap = self._gap(sym, first, last) or _Gap(first, last)
+        try:
+            return await self._fetch_gap(sym, gap)
+        finally:
+            gap.pending = False
+            log_ = self._gap_log.get(sym, [])
+            completed = [g for g in log_ if not g.pending]
+            if len(completed) > GAPS_KEPT:
+                expired = set(completed[:-GAPS_KEPT])
+                log_[:] = [g for g in log_ if g not in expired]
+
+    async def _fetch_gap(self, sym: str, gap: _Gap) -> int:
+        assert self.rest is not None
+        first, last = gap.first, gap.last
         want = last - first + 1 - len(gap.late)
         if want > self.backfill_max_trades:
             self._event("agg_trade", "backfill",

@@ -254,6 +254,50 @@ agg(103)
 check("a gap not fetched at all leaves its ids to the stream",
       sorted(r["agg_id"] for r in sink.of("market.trades")), [100, 103, 105])
 
+print("== queued and in-flight gaps survive the history limit")
+c, sink = make()
+agg(100); agg(105); agg(102)
+for a in range(107, 235, 2):
+    agg(a)
+c.rest = FakeRest(0, 10**6)
+got, _ = backfill(c, *c._gaps.get_nowait())
+rows = sink.of("market.trades")
+check("queued gap remembers the trade delivered before the backlog",
+      (got, sum(r["agg_id"] == 102 for r in rows)), (3, 1))
+check("the queued gap keeps its original stream row",
+      [r["extra"] for r in rows if r["agg_id"] == 102], [""])
+check("finishing one gap keeps all remaining queued gaps",
+      (len(c._gap_log["BTCUSDT"]), c._gaps.qsize()), (65, 64))
+
+c, sink = make()
+agg(100); agg(105)
+class LateRest(FakeRest):
+    async def get(self, *args, **kw):
+        for a in range(107, 235, 2):
+            agg(a)
+        agg(102)
+        return await super().get(*args, **kw)
+c.rest = LateRest(0, 10**6)
+got, _ = backfill(c, *c._gaps.get_nowait())
+agg(103)
+rows = sink.of("market.trades")
+check("in-flight gap remembers late trades across the backlog",
+      (got, sum(r["agg_id"] == 102 for r in rows), sum(r["agg_id"] == 103 for r in rows)),
+      (3, 1, 1))
+
+print("== only completed gaps count against the history limit")
+c, sink = make()
+agg(100)
+c.rest = FakeRest(0, 10**6)
+c.rest.budget = 10_000
+for a in range(102, 234, 2):
+    agg(a)
+    backfill(c, *c._gaps.get_nowait())
+check("completed history stays bounded", len(c._gap_log["BTCUSDT"]), 64)
+check("old completed gaps are evicted, the newest kept",
+      (c._gap("BTCUSDT", 101, 101), c._gap("BTCUSDT", 231, 231) is not None),
+      (None, True))
+
 c, sink = make({"backfill_queue_max": 2})
 for i in range(3):
     c._queue_backfill("BTCUSDT", i * 10, i * 10 + 5)
